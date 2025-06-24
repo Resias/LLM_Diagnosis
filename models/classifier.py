@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.layers import ChannelWiseFC
 
 class Classifier(nn.Module):
     def __init__(self, in_channels, in_dim, n_classes):

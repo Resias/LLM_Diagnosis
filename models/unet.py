@@ -283,7 +283,6 @@ class UnetVAE(nn.Module):
     def __init__(self, 
                 in_length, 
                 in_channels, 
-                z_dim, 
                 num_residual_layers, 
                 num_residual_hiddens, 
                 num_embeddings, 
@@ -375,7 +374,6 @@ def bresenham_style_decrement(ch_expand, len_squeeze):
 
 
 if __name__ == "__main__":
-    
     in_length = 256
     in_channels = 2
     num_hiddens = 0 # dummy
