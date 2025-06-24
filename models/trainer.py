@@ -210,7 +210,7 @@ class Trainer(L.LightningModule):
         
         return total_loss
     
-    def validation_step(self, batch, batch_idx, dataloader_idx=0):
+    def validation_step(self, batch, batch_idx):
         signal_data, meta_data, paried_data, paried_meta_data = batch
         if not self.only_encoder:
             if not self.only_reconstruction:
@@ -267,7 +267,7 @@ class Trainer(L.LightningModule):
         return total_loss
 
     def on_train_epoch_end(self):
-        classify_report(phase='train')
+        self.classify_report(phase='train')
 
     def on_validation_epoch_end(self):
         if self.trainer.state.fn == "fit":
@@ -277,10 +277,10 @@ class Trainer(L.LightningModule):
             prefix = "unknown_val"
         else:
             prefix = "val"
-        classify_report(phase=prefix)
+        self.classify_report(phase=prefix)
         
     def on_test_epoch_end(self):
-        classify_report(phase='test')
+        self.classify_report(phase='test')
 
     def classify_report(self, phase='train'):
         if phase in ['train', 'test']:
@@ -291,13 +291,13 @@ class Trainer(L.LightningModule):
         self.log(f"{phase}/precision", precision, self.batch_size, sync_dist=True)
         self.log(f"{phase}/recall", recall, self.batch_size, sync_dist=True)
         self.log(f"{phase}/f1_score", f1, self.batch_size, sync_dist=True)
-        if self.global_rank == 0:
+        if getattr(self, "global_rank", 0) == 0:
             self.log_confusion_matrix(epoch_type=phase)
         self.y_true.clear()
         self.y_pred.clear()
     
     def log_confusion_matrix(self, epoch_type='val'):
-        cm = confusion_matrix(self.y_true, self.y_pred)
+        cm = confusion_matrix(self.y_true, self.y_pred, labels=range(len(self.classes)))
         fig, ax = plt.subplots(figsize=(6,6))
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=self.classes, yticklabels=self.classes)
         plt.xlabel('Predicted')
