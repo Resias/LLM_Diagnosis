@@ -9,10 +9,7 @@ import numpy as np
 from tqdm import tqdm
 
 from scipy.fft import fft
-from scipy.signal import savgol_filter
-from scipy.signal import stft
-from scipy.signal import resample
-import lightning as L
+
 
 from collections import Counter
 
@@ -54,10 +51,16 @@ class CachedDataset(Dataset):
 
 class VibrationDataset(Dataset):
     def __init__(self, data_root, 
-                    dataset_used    = ['dxai', 'iis', 'mfd', 'vat', 'vbl'], 
+                    dataset_used    = ['dxai', 'mfd', 'vat', 'vbl'], 
                     class_used      = ['looseness', 'normal', 'unbalance','misalignment', 'bearing'], 
                     ch_used         = ['motor_x', 'motor_y'],
-                    ref_class       = 'normal'):
+                    ref_class       = 'normal',
+                    statistic_info  = False):
+        
+        self.statistic_info = statistic_info
+        if self.statistic_info:
+            self.statistic_pipeline = StatisticPipeline(data_type='all')
+        
         
         data_dict = {}
         
