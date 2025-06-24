@@ -13,7 +13,6 @@ from scipy.fft import fft
 from scipy.signal import savgol_filter
 from scipy.signal import stft
 from scipy.signal import resample
-import lightning as L
 
 from collections import Counter
 
@@ -358,7 +357,7 @@ if __name__=='__main__':
 
     
     train_dataset = VibrationDataset(dataset_root, 
-                                    dataset_used = ['dxai', 'iis', 'mfd', 'vat', 'vbl'], 
+                                    dataset_used = ['dxai', 'mfd', 'vat', 'vbl'], 
                                     ch_used=['motor_x', 'motor_y'], 
                                     class_used=['looseness', 'normal', 'unbalance', 'misalignment', 'bearing']
                                     )
