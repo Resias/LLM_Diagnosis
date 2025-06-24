@@ -4,6 +4,7 @@ from torch.utils.data import random_split, DataLoader
 import lightning as L
 from lightning.pytorch.strategies import DDPStrategy
 from lightning.pytorch.loggers import WandbLogger
+from pytorch_lightning.profilers import SimpleProfiler
 
 
 from models.unet import UnetVAE
@@ -110,6 +111,7 @@ def get_dataset(args):
         focal_alpha = None
     sample = dataset[0]
     in_channels, in_length = sample[0].shape
+    print(f"Data Shape : {in_channels} x {in_length}")
     return [train_set, val_set, test_set], in_channels, in_length, focal_alpha
 
 def get_accelerator_and_strategy():
@@ -130,6 +132,7 @@ def get_accelerator_and_strategy():
         accelerator = "cpu"
         strategy = None
         devices = 1
+    print(f"accelerator : {accelerator}, Startegy : {strategy}, No.Devices : {devices}")
     return accelerator, strategy, devices
 
 def save_model_and_classifier(model, classifier, args, save_root='model_saved'):
@@ -173,13 +176,13 @@ if __name__ == '__main__':
     train_dataloader = DataLoader(dataset[0], batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
     valid_dataloader = DataLoader(dataset[1], batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
     test_dataloader = DataLoader(dataset[2], batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
-
+    print("Ready for DataLoader")
     # ---------------------------
     # 모델 및 분류기 준비
     # ---------------------------
     model = get_model(args, in_channels, in_length)
     classifier = get_classifier(args)
-    
+    print("Ready for models")
     # ---------------------------
     # Trainer 세팅
     # ---------------------------
@@ -192,6 +195,7 @@ if __name__ == '__main__':
         classifier=classifier,
         classes=args.class_used
         )
+    print("Ready for Training")
     # ---------------------------
     # Wandb Logger 설정
     # ---------------------------
@@ -206,7 +210,7 @@ if __name__ == '__main__':
         log_model=True,  # 모델 구조 로깅
         config = vars(args)
     )
-    
+    print("Ready for Logging")
     # ---------------------------
     # Lightning Trainer 실행
     # ---------------------------

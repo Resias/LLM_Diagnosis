@@ -141,7 +141,7 @@ class VibrationDataset(Dataset):
     
     
 class OrderFreqPipeline:
-    def __init__(self, harmonics=10, points_per_harmonic=30):
+    def __init__(self, harmonics=8, points_per_harmonic=32):
         self.harmonics = harmonics
         self.points_per_harmonic = points_per_harmonic
         
