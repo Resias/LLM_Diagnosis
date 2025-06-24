@@ -1,18 +1,18 @@
 import os
 import pandas as pd
-from torch.utils.data import DataLoader, Dataset, random_split
+from torch.utils.data import Dataset
 
 import torch
 import random
 import numpy as np
-from scipy.signal import butter, filtfilt
+
 from tqdm import tqdm
-from sklearn.preprocessing import MinMaxScaler
-import matplotlib.pyplot as plt
+
 from scipy.fft import fft
 from scipy.signal import savgol_filter
 from scipy.signal import stft
 from scipy.signal import resample
+import lightning as L
 
 from collections import Counter
 
@@ -54,10 +54,10 @@ class CachedDataset(Dataset):
 
 class VibrationDataset(Dataset):
     def __init__(self, data_root, 
-                    dataset_used = ['dxai', 'mfd', 'vat', 'vbl'], 
-                    class_used = ['looseness', 'normal', 'unbalance','misalignment', 'bearing'], 
-                    ch_used = ['motor_x', 'motor_y'],
-                    ref_class = 'normal'):
+                    dataset_used    = ['dxai', 'iis', 'mfd', 'vat', 'vbl'], 
+                    class_used      = ['looseness', 'normal', 'unbalance','misalignment', 'bearing'], 
+                    ch_used         = ['motor_x', 'motor_y'],
+                    ref_class       = 'normal'):
         
         data_dict = {}
         
@@ -115,6 +115,13 @@ class VibrationDataset(Dataset):
         else:
             signal_tensor = torch.tensor(signal_np)
             ref_tensor = torch.tensor(ref_np)
+            
+        if self.statistic_info:
+            freq_feature_dict, time_feature_dict = self.statistic_pipeline(signal_np, signal_info['sampling_rate'])
+            ref_freq_feature_dict, ref_time_feature_dict = self.statistic_pipeline(ref_np, ref_info['sampling_rate'])
+            
+            return signal_tensor, signal_info, ref_tensor, ref_info, freq_feature_dict, time_feature_dict, ref_freq_feature_dict, ref_time_feature_dict
+        
         return signal_tensor, signal_info, ref_tensor, ref_info
     
     def open_file(self, file_path):
@@ -125,6 +132,7 @@ class VibrationDataset(Dataset):
         class_name, sampling_rate, rpm, severity, load_condition, data_idx = file_name.split('_')
         sampling_rate = float(sampling_rate[:-3])*1000
         rpm = float(rpm)
+        specific_class = class_name
         class_name = class_name.split('-')[0]
         
         meta_info = {
@@ -133,7 +141,8 @@ class VibrationDataset(Dataset):
             'rpm' : rpm,
             'severity' : severity,
             'load_condition' : load_condition,
-            'data_idx' : data_idx
+            'data_idx' : data_idx,
+            'specific_class' : specific_class
         }
         
         return file_np, meta_info
@@ -248,10 +257,10 @@ class StatisticPipeline:
                 "variance_frequency": variance_frequency
             }
 
-            feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
+            # feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
             feature_list.append(features)
 
-        return torch.stack(feature_tensors), feature_list
+        return feature_list
 
     def extract_time_domain_features_multichannel(self, signals):
         """
@@ -291,10 +300,10 @@ class StatisticPipeline:
                 "shape_factor": signal_shape
             }
 
-            feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
+            # feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
             feature_list.append(features)
 
-        return torch.stack(feature_tensors), feature_list
+        return feature_list
 
     def compute_fft_multichannel(signals: np.ndarray, sampling_rate: float):
         """
@@ -318,14 +327,13 @@ class StatisticPipeline:
 
         return results
 
-    def __call__(self, data_np, sampling_rate, sync_freq):
+    def __call__(self, data_np, sampling_rate):
         """
         Process a single tensor of vibration data.
 
         Args:
         - data (torch.Tensor): Input data of shape (channels, time_steps).
         - sampling_rate (float): Sampling rate of the data in Hz.
-        - sync_freq (float): Rotational synchronous frequency in Hz.
 
         Returns:
         - torch.Tensor: Processed data of shape (channels, harmonics * points_per_harmonic).
@@ -333,13 +341,17 @@ class StatisticPipeline:
         """
         
         if self.data_type == 'freq':
-            feature_tensor, feature_dict = self.extract_frequency_domain_features_multichannel(signals=data_np, sampling_rate=sampling_rate)
+            feature_dict = self.extract_frequency_domain_features_multichannel(signals=data_np, sampling_rate=sampling_rate)
+            return feature_dict
         elif self.data_type == 'time':
-            feature_tensor, feature_dict = self.extract_time_domain_features_multichannel(signals=data_np)
+            feature_dict = self.extract_time_domain_features_multichannel(signals=data_np)
+            return feature_dict
+        elif self.data_type == 'all':
+            freq_feature_dict = self.extract_frequency_domain_features_multichannel(signals=data_np, sampling_rate=sampling_rate)
+            time_feature_dict = self.extract_time_domain_features_multichannel(signals=data_np)
+            return freq_feature_dict, time_feature_dict
         else:
             print(f'Worng feature domain : {self.data_type}')
-        
-        return feature_tensor, feature_dict
 
 
 
