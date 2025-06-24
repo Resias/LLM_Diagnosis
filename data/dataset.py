@@ -40,8 +40,8 @@ class CachedDataset(Dataset):
 
             # 데이터셋을 (tensor, dict) 형태로 저장
             for i in tqdm(range(len(dataset)), desc="Dataset Caching", unit="samples"):
-                signal_tensor, signal_info, ref_tensor, ref_info, weak_aug, strong_aug  = dataset[i]
-                self.data.append((signal_tensor, signal_info, ref_tensor, ref_info, weak_aug, strong_aug))  # 리스트에 추가
+                signal_tensor, signal_info, ref_tensor, ref_info  = dataset[i]
+                self.data.append((signal_tensor, signal_info, ref_tensor, ref_info))  # 리스트에 추가
 
             print("Cached Complete! Saving")
             torch.save(self.data, cache_path)  # `.pt` 파일로 저장
@@ -345,7 +345,7 @@ class StatisticPipeline:
 
 
 if __name__=='__main__':
-    dataset_root = '/root/tmp/dataset'
+    dataset_root = '/home/data/'
     preprocessing_type = 'raw'
     data_type = 'freq' 
 
