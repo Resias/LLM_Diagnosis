@@ -109,7 +109,7 @@ def get_dataset(args):
     else:
         focal_alpha = None
     sample = dataset[0]
-    in_channels, in_length = sample.shape
+    in_channels, in_length = sample[0].shape
     return [train_set, val_set, test_set], in_channels, in_length, focal_alpha
 
 def get_accelerator_and_strategy():
@@ -170,9 +170,9 @@ if __name__ == '__main__':
     dataset, in_channels, in_length, focal_alpha = get_dataset(args)
     num_workers = min(4, os.cpu_count() // 2)
 
-    train_dataloader = DataLoader(dataset[0], batch_size=arg.batch_size, shuffle=True, num_workers=num_workers)
-    valid_dataloader = DataLoader(dataset[1], batch_size=arg.batch_size, shuffle=True, num_workers=num_workers)
-    test_dataloader = DataLoader(dataset[2], batch_size=arg.batch_size, shuffle=False, num_workers=num_workers)
+    train_dataloader = DataLoader(dataset[0], batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    valid_dataloader = DataLoader(dataset[1], batch_size=args.batch_size, shuffle=True, num_workers=num_workers)
+    test_dataloader = DataLoader(dataset[2], batch_size=args.batch_size, shuffle=False, num_workers=num_workers)
 
     # ---------------------------
     # 모델 및 분류기 준비
