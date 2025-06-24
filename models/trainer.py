@@ -105,7 +105,6 @@ class Trainer(L.LightningModule):
                     anomaly_threshold=0.5,
                     apply_ttt=False,
                     only_encoder=False,
-                    saved_name = None,
                     only_reconstruction=False):
         super(Trainer, self).__init__()
         self.model = model
@@ -126,7 +125,6 @@ class Trainer(L.LightningModule):
         self.apply_ttt = apply_ttt
         if self.only_encoder:
             print('This model only classify!')
-        self.save_name = saved_name
         self.automatic_optimization = False
         
     def label_to_index(self, labels):
