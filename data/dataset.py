@@ -54,10 +54,10 @@ class CachedDataset(Dataset):
 
 class VibrationDataset(Dataset):
     def __init__(self, data_root, 
-                    dataset_used    = ['dxai', 'iis', 'mfd', 'vat', 'vbl'], 
-                    class_used      = ['looseness', 'normal', 'unbalance','misalignment', 'bearing'], 
-                    ch_used         = ['motor_x', 'motor_y'],
-                    ref_class       = 'normal'):
+                    dataset_used = ['dxai', 'mfd', 'vat', 'vbl'], 
+                    class_used = ['looseness', 'normal', 'unbalance','misalignment', 'bearing'], 
+                    ch_used = ['motor_x', 'motor_y'],
+                    ref_class = 'normal'):
         
         data_dict = {}
         

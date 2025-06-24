@@ -26,7 +26,7 @@ def get_args():
     # 데이터셋 관련 옵션들
     parser.add_argument('--dataset_root', type=str, help='dataset_root', default='/home/data/')
     parser.add_argument('--channels_used', type=list, help='select using channels for training', default=['motor_x', 'motor_y'])
-    parser.add_argument('--dataset_used', type=list, help='dataset for training', default = ['dxai', 'iis', 'mfd', 'vat', 'vbl'])
+    parser.add_argument('--dataset_used', type=list, help='dataset for training', default = ['dxai', 'mfd', 'vat', 'vbl'])
     parser.add_argument('--class_used', type=list, help='classes for training', default=['looseness', 'normal', 'unbalance','misalignment', 'bearing'])
 
     parser.add_argument('--use_cache', type=int, help='use cache dataset', choices=[0, 1], default=1)
