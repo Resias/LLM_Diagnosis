@@ -346,11 +346,11 @@ class StatisticPipeline:
 
 if __name__=='__main__':
     dataset_root = '/home/data/'
-    preprocessing_type = 'raw'
+    preprocessing_type = 'order_freq'
     data_type = 'freq' 
 
     if preprocessing_type == 'order_freq':
-        pipeline = OrderFreqPipeline(harmonics=8, points_per_harmonic=32, smoothing_steps=1, smoothing_param=0.1, log_scale=True)
+        pipeline = OrderFreqPipeline(harmonics=8, points_per_harmonic=32)
     elif preprocessing_type == 'statistic':
         pipeline = StatisticPipeline(data_type=data_type)
     else:
@@ -358,9 +358,13 @@ if __name__=='__main__':
 
     
     train_dataset = VibrationDataset(dataset_root, 
-                                    dataset_used=['dxai'], 
+                                    dataset_used = ['dxai', 'iis', 'mfd', 'vat', 'vbl'], 
                                     ch_used=['motor_x', 'motor_y'], 
                                     class_used=['looseness', 'normal', 'unbalance', 'misalignment', 'bearing']
                                     )
-    signal_tensor, signal_info, ref_tensor, ref_info = train_dataset[0]
+    for batch in tqdm(train_dataset,desc="for checking Nan"):
+        signal_tensor, signal_info, ref_tensor, ref_info = batch
+        if torch.isnan(signal_tensor).any():
+            print("NaN detected in signal_tensor. Breaking.")
+            break
     print(signal_tensor.shape)

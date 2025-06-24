@@ -147,13 +147,11 @@ class Trainer(L.LightningModule):
         return [opt_model, opt_classifier], [sch_model, sch_classifier]
 
     def compute_recon_loss(self, signal_data, meta_data, bypass_detach=False):
-        # 여기
         recon, distribution_loss = self.model(signal_data)
         origianl_distribution_loss = distribution_loss
         recon_loss = self.mse_loss(recon, signal_data)
         
         beta = max(0.0, min(0.1, 1 - abs((self.current_epoch - 100) / 100)))
-
         total_loss = recon_loss + beta * distribution_loss
         distribution_loss = beta * distribution_loss
 
@@ -205,7 +203,6 @@ class Trainer(L.LightningModule):
             # Scheduler (매 step마다 step 하거나 조건 걸기)
             lr_scheduler_model.step()
             lr_scheduler_cls.step()
-        
         return total_loss
     
     def validation_step(self, batch, batch_idx):
