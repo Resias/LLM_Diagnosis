@@ -150,11 +150,20 @@ class Trainer(L.LightningModule):
         recon, distribution_loss = self.model(signal_data)
         origianl_distribution_loss = distribution_loss
         recon_loss = self.mse_loss(recon, signal_data)
+        if torch.isnan(recon).any() or torch.isinf(recon).any():
+            print('NaN/Inf in recon')
+        if torch.isnan(distribution_loss).any() or torch.isinf(distribution_loss).any():
+            print('NaN/Inf in distribution_loss')
+        if torch.isnan(recon_loss).any() or torch.isinf(recon_loss).any():
+            print('NaN/Inf in recon_loss')
         
         beta = max(0.0, min(0.1, 1 - abs((self.current_epoch - 100) / 100)))
         total_loss = recon_loss + beta * distribution_loss
         distribution_loss = beta * distribution_loss
-
+        if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
+            print('NaN/Inf in total_loss', 'beta:', beta)
+            print('recon_loss:', recon_loss)
+            print('distribution_loss:', distribution_loss)
         total_loss = total_loss.sum()
         
         return total_loss, recon_loss, origianl_distribution_loss
@@ -170,6 +179,9 @@ class Trainer(L.LightningModule):
     
     def training_step(self, batch, batch_idx):
         signal_data, meta_data, paried_data, paried_meta_data = batch
+        if torch.isnan(signal_data).any():
+            print("NaN detected in signal_data. Breaking.")
+            return
         if not self.only_encoder:
             if not self.only_reconstruction:
                 total_loss, recon_loss, distribution_loss = self.compute_recon_loss(signal_data, meta_data)
@@ -178,8 +190,23 @@ class Trainer(L.LightningModule):
                 total_loss = recon_loss
         else:
             total_loss = 0.0
+        if torch.isnan(recon_loss).any():
+            print(f"NaN in recon_loss, batch_idx={batch_idx}")
+            return
+        if torch.isnan(distribution_loss).any():
+            print(f"NaN in distribution_loss, batch_idx={batch_idx}")
+            return
+        if torch.isnan(total_loss).any():
+            print(f"NaN in total_loss, batch_idx={batch_idx}")
+            return
 
         class_loss, pred, indices = self.compute_classification_loss(signal_data, meta_data, ref_data=paried_data)
+        if torch.isnan(class_loss).any():
+            print(f"NaN in class_loss, batch_idx={batch_idx}")
+            return
+        if torch.isnan(pred).any():
+            print(f"NaN in pred, batch_idx={batch_idx}")
+            return
         
         total_loss += class_loss
         self.y_true.extend(indices.cpu().numpy())
@@ -278,6 +305,9 @@ class Trainer(L.LightningModule):
         self.classify_report(phase='test')
 
     def classify_report(self, phase='train'):
+        if len(self.y_true) == 0 or len(self.y_pred) == 0:
+            print(f'[{phase}] Warning: No predictions, skip metrics.')
+            return
         if phase in ['train', 'test']:
             precision, recall, f1, _ = precision_recall_fscore_support(self.y_true, self.y_pred, average='macro', zero_division=1)
         else:

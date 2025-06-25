@@ -17,6 +17,9 @@ import wandb
 import argparse
 import numpy as np
 
+torch.backends.cuda.matmul.allow_tf32 = False   # (or False)
+torch.backends.cudnn.allow_tf32 = False
+
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train Fault classify model Config")
