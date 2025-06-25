@@ -2,37 +2,46 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 
+from data.dataset import VibrationDataset
 from models.unet import UnetVAE
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling
 from peft import get_peft_model, LoraConfig, TaskType
+from transformers import BitsAndBytesConfig
+
 
 class Projector(nn.Module):
-    def __init__(self, output_dim):
+    def __init__(self, in_dim, output_dim):
         super().__init__()
         self.projector = nn.Sequential(
-            nn.Linear(256, output_dim),
+            nn.Flatten(),
+            nn.Linear(in_dim, output_dim),
             nn.Tanh()
         )
-
     def forward(self, x):
         return self.projector(x)
 
-# 3. Full Model wrapping
 class FullModel(nn.Module):
-    def __init__(self, u_encoder, projector, llm, vib_token_id):
+    def __init__(self, encoder, projector, llm, vib_token_id):
         super().__init__()
-        self.u_encoder = u_encoder
+        self.encoder = encoder
         self.projector = projector
         self.llm = llm
         self.vib_token_id = vib_token_id
-
-    def forward(self, input_ids, attention_mask, vibration_signal, labels=None):
+        
+    def forward(self, input_ids, attention_mask, labels, cur_signal, ref_signal):
         input_embeds = self.llm.get_input_embeddings()(input_ids)
-        u_features = self.u_encoder(vibration_signal)
-        vib_embed = self.projector(u_features).unsqueeze(1)
-        mask = (input_ids == self.vib_token_id).unsqueeze(-1)
-        input_embeds = torch.where(mask, vib_embed, input_embeds)
+        
+        ref_feature = self.encoder(ref_signal)
+        ref_embed = self.projector(ref_feature).unsqueeze(1)
+        ref_mask = (input_ids == self.vib_token_id).cumsum(dim=1) == 1
+        input_embeds = torch.where(ref_mask.unsqueeze(-1), ref_embed, input_embeds)
+        
+        cur_feature = self.encoder(cur_signal)
+        cur_embed = self.projector(cur_feature).unsqueeze(1)
+        cur_mask = (input_ids == self.vib_token_id).cumsum(dim=1) == 2
+        input_embeds = torch.where(cur_mask.unsqueeze(-1), cur_embed, input_embeds)
+        
         outputs = self.llm(inputs_embeds=input_embeds, attention_mask=attention_mask, labels=labels)
         return outputs
 
@@ -73,6 +82,7 @@ class VibrationSFTDatasetEnglish(Dataset):
 
             Diagnostic target classes: looseness, normal, unbalance, misalignment, bearing.
 
+            Reference vibration state: <VIB_EMB>
             Current vibration state: <VIB_EMB>
 
             Time domain features (reference, x-axis): {ref_time_feature_dict[0]}
@@ -123,58 +133,10 @@ class VibrationSFTDatasetEnglish(Dataset):
             "input_ids": input_ids,
             "attention_mask": encoded['attention_mask'].squeeze(0),
             "labels": labels,
-            "signal_tensor": signal_tensor,  # vibration input for embedding injection
-            "ref_tensor": ref_tensor
+            "cur_signal": signal_tensor,  # vibration input for embedding injection
+            "ref_signal": ref_tensor
         }
 
-if __name__ == '__main__':
-
-    
-    unet_vae = UnetVAE()
-    
-    
-    
-    
-    
-    model_name = "meta-llama/Llama-3.2-3B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    special_tokens_dict = {'additional_special_tokens': ['<VIB_EMB>']}
-    tokenizer.add_special_tokens(special_tokens_dict)
-
-    llm = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
-    llm.resize_token_embeddings(len(tokenizer))
-
-    # PEFT (LoRA 적용)
-    peft_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False,
-        r=8, lora_alpha=32, lora_dropout=0.05
-    )
-    llm = get_peft_model(llm, peft_config)
-    llm.print_trainable_parameters()
-
-
-
-
-
-# 5. Data Collator (vibration_signal 포함)
-def data_collator(features):
-    input_ids = torch.stack([f['input_ids'] for f in features])
-    attention_mask = torch.stack([f['attention_mask'] for f in features])
-    labels = torch.stack([f['labels'] for f in features])
-    vibration_signal = torch.stack([f['vibration_signal'] for f in features])
-    return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "labels": labels,
-        "vibration_signal": vibration_signal
-    }
-
-# 6. 전체 Trainer 호환 모델 포장
 class TrainerModelWrapper(nn.Module):
     def __init__(self, full_model):
         super().__init__()
@@ -182,33 +144,95 @@ class TrainerModelWrapper(nn.Module):
 
     def forward(self, input_ids, attention_mask, labels, vibration_signal):
         return self.model(input_ids, attention_mask, vibration_signal, labels=labels)
+    
+def data_collator(features):
+    input_ids = torch.stack([f['input_ids'] for f in features])
+    attention_mask = torch.stack([f['attention_mask'] for f in features])
+    labels = torch.stack([f['labels'] for f in features])
+    cur_signal = torch.stack([f['cur_signal'] for f in features])
+    ref_signal = torch.stack([f['ref_signal'] for f in features])
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels,
+        "cur_signal": cur_signal,  # vibration input for embedding injection
+        "ref_signal": ref_signal
+    }
 
-# 7. 전체 학습 실행
-u_encoder = UEncoder().to("cuda")
-projector = Projector(output_dim=llm.config.hidden_size).to("cuda")
-vib_token_id = tokenizer.convert_tokens_to_ids('<VIB_EMB>')
-full_model = FullModel(u_encoder, projector, llm, vib_token_id).to("cuda")
-
-dataset = VibrationDataset(tokenizer)
-
-training_args = TrainingArguments(
-    output_dir="./output",
-    num_train_epochs=1,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
-    learning_rate=5e-5,
-    fp16=True,
-    save_steps=10,
-    save_total_limit=2,
-    logging_steps=1,
-    report_to="none"
-)
-
-trainer = Trainer(
-    model=TrainerModelWrapper(full_model),
-    args=training_args,
-    train_dataset=dataset,
-    data_collator=data_collator,
-)
-
-trainer.train()
+if __name__ == '__main__':
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # 진동에 학습된 모델 불러오기
+    unet_vae = UnetVAE(
+        in_length               =256, 
+        in_channels             =2, 
+        num_residual_layers     =8, 
+        num_residual_hiddens    =2, 
+        num_embeddings          =128, 
+        embedding_dim           =32
+    )
+    vib_encoder = unet_vae.encoder.to(device)
+    vibration_dataset = VibrationDataset(
+        data_root='/workspace/dataset',
+        statistic_info=True
+    )
+    
+    # LLM 모델 불러오기
+    model_name = "meta-llama/Llama-3.2-3B-Instruct"
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    special_tokens_dict = {'additional_special_tokens': ['<VIB_EMB>']}
+    tokenizer.add_special_tokens(special_tokens_dict)
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,  # or torch.float16 if bfloat16 불가
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
+    )
+    llm = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,   # 또는 torch.float16
+        quantization_config=bnb_config,
+        device_map=None  # ✅ device_map 아예 사용하지 말 것!
+    )
+    llm.resize_token_embeddings(len(tokenizer))
+    print(f'llm toekn size : {llm.config.hidden_size}')
+    
+    
+    for param in vib_encoder.parameters():
+        param.requires_grad = False
+    projector = Projector(
+        in_dim= int(128 * 32),
+        output_dim=llm.config.hidden_size).to(device)
+    vib_token_id = tokenizer.convert_tokens_to_ids('<VIB_EMB>')
+    
+    full_model = FullModel(vib_encoder, projector, llm, vib_token_id).to(device)
+    
+    dataset = VibrationSFTDatasetEnglish(
+        tokenizer = tokenizer,
+        vibration_dataset= vibration_dataset,
+        max_length=2048
+    )
+    
+    training_args = TrainingArguments(
+        output_dir="./output",
+        num_train_epochs=1,
+        per_device_train_batch_size=1,
+        max_steps=10,
+        gradient_accumulation_steps=4,
+        learning_rate=5e-5,
+        fp16=True,
+        save_steps=10,
+        save_total_limit=2,
+        logging_steps=1,
+        report_to="none"
+    )
+    
+    trainer = Trainer(
+        model=full_model,
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=data_collator,
+    )
+    trainer.train()

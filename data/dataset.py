@@ -255,13 +255,13 @@ class StatisticPipeline:
                 "mean_frequency": mean_frequency,
                 "median_frequency": median_frequency,
                 "spectral_skewness": spectral_skewness,
-                "spectral_kurtosis": spectral_kurtosis,
-                "peak_amplitude": peak_amplitude,
-                "band_energy_0.1_1Hz": band_energy,
-                "dominant_frequency_power": dominant_frequency_power,
-                "spectral_entropy": spectral_entropy,
-                "rms_frequency": rms_frequency,
-                "variance_frequency": variance_frequency
+                # "spectral_kurtosis": spectral_kurtosis,
+                # "peak_amplitude": peak_amplitude,
+                # "band_energy_0.1_1Hz": band_energy,
+                # "dominant_frequency_power": dominant_frequency_power,
+                # "spectral_entropy": spectral_entropy,
+                # "rms_frequency": rms_frequency,
+                # "variance_frequency": variance_frequency
             }
 
             # feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
@@ -298,13 +298,13 @@ class StatisticPipeline:
                 "max": signal_max,
                 "min": signal_min,
                 "rms": signal_rms,
-                "skewness": signal_skew,
-                "kurtosis": signal_kurt,
-                "peak": signal_peak,
-                "ppv": signal_ppv,
-                "crest_factor": signal_crest,
-                "impulse_factor": signal_impulse,
-                "shape_factor": signal_shape
+                # "skewness": signal_skew,
+                # "kurtosis": signal_kurt,
+                # "peak": signal_peak,
+                # "ppv": signal_ppv,
+                # "crest_factor": signal_crest,
+                # "impulse_factor": signal_impulse,
+                # "shape_factor": signal_shape
             }
 
             # feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
