@@ -2,5 +2,4 @@ data/__pycache__/
 models/__pycache__/
 cached/
 results/
-model_saved/
 *.ipynb
