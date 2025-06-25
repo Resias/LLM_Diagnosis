@@ -152,9 +152,10 @@ class VibrationDataset(Dataset):
     
     
 class OrderFreqPipeline:
-    def __init__(self, harmonics=8, points_per_harmonic=32):
+    def __init__(self, harmonics=8, points_per_harmonic=32, log_scale=True):
         self.harmonics = harmonics
         self.points_per_harmonic = points_per_harmonic
+        self.log_scale = log_scale
         
     def scale_to_detailed_harmonics(self, magnitude, freqs, sync_freq):
         """
@@ -209,6 +210,9 @@ class OrderFreqPipeline:
         
         # Step 3: Scale to detailed harmonics
         detailed_magnitude, detailed_bins = self.scale_to_detailed_harmonics(magnitude, freqs, sync_freq)
+        
+        if self.log_scale:
+            detailed_magnitude = np.log1p(detailed_magnitude)
 
         
         return torch.tensor(detailed_magnitude, dtype=torch.float32), detailed_bins
