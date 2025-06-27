@@ -238,33 +238,19 @@ class StatisticPipeline:
 
             total_power = np.sum(fft_values**2)
             max_frequency = freq[np.argmax(fft_values)]
-            mean_frequency = np.sum(freq * fft_values) / np.sum(fft_values)
-            median_frequency = freq[np.cumsum(fft_values) >= np.sum(fft_values) / 2][0]
-            spectral_skewness = np.mean((freq - mean_frequency)**3 * fft_values) / (np.std(freq) + 1e-10)**3
-            spectral_kurtosis = np.mean((freq - mean_frequency)**4 * fft_values) / (np.std(freq) + 1e-10)**4
-            peak_amplitude = np.max(fft_values)
-            band_energy = np.sum(fft_values[(freq >= 0.1) & (freq <= 1.0)]**2)
+            spectral_kurtosis = np.mean((freq - np.sum(freq * fft_values) / np.sum(fft_values))**4 * fft_values) / (np.std(freq) + 1e-10)**4
             dominant_frequency_power = fft_values[np.argmax(fft_values)]**2
+            band_energy = np.sum(fft_values[(freq >= 0.1) & (freq <= 1.0)]**2)
             spectral_entropy = -np.sum((fft_values / np.sum(fft_values)) * np.log2(fft_values / np.sum(fft_values) + 1e-10))
-            rms_frequency = np.sqrt(np.mean(fft_values**2))
-            variance_frequency = np.var(fft_values)
 
             features = {
                 "total_power": total_power,
                 "max_frequency": max_frequency,
-                "mean_frequency": mean_frequency,
-                "median_frequency": median_frequency,
-                "spectral_skewness": spectral_skewness,
-                # "spectral_kurtosis": spectral_kurtosis,
-                # "peak_amplitude": peak_amplitude,
-                # "band_energy_0.1_1Hz": band_energy,
-                # "dominant_frequency_power": dominant_frequency_power,
-                # "spectral_entropy": spectral_entropy,
-                # "rms_frequency": rms_frequency,
-                # "variance_frequency": variance_frequency
+                "spectral_kurtosis": spectral_kurtosis,
+                "dominant_frequency_power": dominant_frequency_power,
+                "band_energy_0.1_1Hz": band_energy,
+                "spectral_entropy": spectral_entropy
             }
-
-            # feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
             feature_list.append(features)
 
         return feature_list
@@ -281,33 +267,19 @@ class StatisticPipeline:
         for signal in signals:
             signal_mean = np.mean(signal)
             signal_std = np.std(signal)
-            signal_max = np.max(signal)
-            signal_min = np.min(signal)
             signal_rms = np.sqrt(np.mean(signal**2))
-            signal_skew = np.mean((signal - signal_mean)**3) / (signal_std**3 + 1e-10)
-            signal_kurt = np.mean((signal - signal_mean)**4) / (signal_std**4 + 1e-10)
             signal_peak = np.max(np.abs(signal))
-            signal_ppv = signal_max - signal_min
             signal_crest = signal_peak / (signal_rms + 1e-10)
-            signal_impulse = signal_peak / (np.mean(np.abs(signal)) + 1e-10)
-            signal_shape = signal_rms / (np.mean(np.abs(signal)) + 1e-10)
+            signal_kurt = np.mean((signal - signal_mean)**4) / (signal_std**4 + 1e-10)
 
             features = {
                 "mean": signal_mean,
                 "std": signal_std,
-                "max": signal_max,
-                "min": signal_min,
                 "rms": signal_rms,
-                # "skewness": signal_skew,
-                # "kurtosis": signal_kurt,
-                # "peak": signal_peak,
-                # "ppv": signal_ppv,
-                # "crest_factor": signal_crest,
-                # "impulse_factor": signal_impulse,
-                # "shape_factor": signal_shape
+                "peak": signal_peak,
+                "crest_factor": signal_crest,
+                "kurtosis": signal_kurt
             }
-
-            # feature_tensors.append(torch.tensor(list(features.values()), dtype=torch.float32))
             feature_list.append(features)
 
         return feature_list
