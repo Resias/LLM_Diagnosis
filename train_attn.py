@@ -1,5 +1,5 @@
-from data.order_dataset import OrderFreqDataset, CachedDataset
-from segment_transformer import SegmentLevelModel
+from data.order_dataset import OrderFreqDataset
+from models.segment_transformer import SegmentLevelModel
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 from torch.nn.functional import cross_entropy
