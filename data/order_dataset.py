@@ -3,7 +3,6 @@ import pandas as pd
 import random
 import numpy as np
 from torch.utils.data import Dataset
-from scipy.fft import fft
 from scipy.interpolate import interp1d
 import torch
 from tqdm import tqdm
@@ -206,7 +205,7 @@ class OrderFreqDataset(Dataset):
 if __name__ == '__main__':
     
     dataset = OrderFreqDataset(
-        data_root= '../dataset'
+        data_root= '/home/data'
     )
 
     sample_tensor, normal_tensor, class_tensor = dataset[0]
