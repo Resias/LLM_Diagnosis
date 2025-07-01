@@ -39,7 +39,14 @@ class CachedDataset(Dataset):
         return self.data[index]  # (tensor, meta_data) 형태 반환
 
 class OrderFreqDataset(Dataset):
-    def __init__(self, data_root, classes = ['normal', 'looseness', 'misalignment', 'unbalance', 'bearing'], averaging_size = 100, target_len=260, sensor_list=['motor_x', 'motor_y'], max_order = 10):
+    def __init__(self, data_root, 
+                classes = ['normal', 'looseness', 'misalignment', 'unbalance', 'bearing'], 
+                dataset_list = ['dxai', 'mfd', 'vat', 'vbl'],
+                averaging_size = 100, 
+                target_len=260, 
+                sensor_list=['motor_x', 'motor_y'], 
+                max_order = 10,
+                cache_dir = './cache'):
         
         self.classes        = classes
         self.averaging_size = averaging_size
@@ -47,53 +54,31 @@ class OrderFreqDataset(Dataset):
         self.sensor_list    = sensor_list
         self.max_order      = max_order
         
-        dataset_col = []
-        class_col = []
-        specific_col = []
-        load_col = []
-        severity_col = []
-        file_path_col = []
-
-        for dataset_name in os.listdir(data_root):
-            dataset_dir = os.path.join(data_root, dataset_name)
+        data_cache_path = os.path.join(cache_dir, 'mag.npy')
+        info_cache_path = os.path.join(cache_dir, 'info.csv')
+        if os.path.exists(data_cache_path):
+            print(f'load from caching...')
+            data_np = np.load(data_cache_path)
+            dataset_df = pd.read_csv(info_cache_path)
             
-            for class_name in os.listdir(dataset_dir):
-                class_dir = os.path.join(dataset_dir, class_name)
-                
-                file_path_list = []
-                for file_name in os.listdir(class_dir):
-                    specific_class, _, _, severity, load_condition, _ = os.path.split(file_name)[-1].split('_')
-                    
-                    specific_col.append(specific_class)
-                    severity_col.append(severity)
-                    load_col.append(load_condition)
-                    
-                    file_path = os.path.join(class_dir, file_name)
-                    file_path_list.append(file_path)
-                    
-                class_col += ([class_name]*len(file_path_list))
-                dataset_col += ([dataset_name]*len(file_path_list))
-                file_path_col += file_path_list
-
-
-        self.dataset_df = pd.DataFrame({
-            'dataset' : dataset_col,
-            'class_name' : class_col,
-            'specific_class' : specific_col,
-            'load_condition' : load_col,
-            'severity' : severity,
-            'file_path' : file_path_col
-        })
-    
+            self.dataset_df = dataset_df
+            self.data_np = data_np
+        else:
+            print(f'caching start...')
+            self.load_dataset(
+                data_root=data_root,
+                cache_dir=cache_dir
+            )
+        
+        
     def __len__(self):
         return len(self.dataset_df)
         
     def __getitem__(self, index):
         
-        row = self.dataset_df.iloc()[index]
         
-        sample_np, normal_np, data_info = self.sampling_smoothing(row)
-        class_name = data_info['class_name']
+        sample_np, normal_np, class_name = self.sampling_smoothing(index)
+        
         
         sample_tensor = torch.tensor(sample_np, dtype=torch.float32)
         normal_tensor = torch.tensor(normal_np, dtype=torch.float32)
@@ -102,34 +87,27 @@ class OrderFreqDataset(Dataset):
         return sample_tensor, normal_tensor, class_tensor
         
         
-    def sampling_smoothing(self, row):
+    def sampling_smoothing(self, index):
+        
+        row = self.dataset_df.iloc()[index]
         
         dataset = row['dataset']
         class_name = row['class_name']
-        file_path = row['file_path']
-        specific_class = row['specific_class']
+        specific_class = row['specific_class_name']
         severity = row['severity']
         load_condition = row['load_condition']
         
-        sample_mag, interpolated_freq, data_info = self.open_file(file_path)
+        sample_mag = self.data_np[index]
 
         intra_samples = self.dataset_df[(self.dataset_df['dataset'] == dataset) & \
                                         (self.dataset_df['class_name'] == class_name) & \
-                                        (self.dataset_df['specific_class'] == specific_class) & \
+                                        (self.dataset_df['specific_class_name'] == specific_class) & \
                                         (self.dataset_df['load_condition'] == load_condition) & \
                                         (self.dataset_df['severity'] == severity)    ].sample(n=self.averaging_size)
-        intra_mag_list = []
-        for sample in intra_samples['file_path']:
-            interpolated_mag, _, _ = self.open_file(sample)
-            intra_mag_list.append(interpolated_mag)
-        intra_mag_np = np.array(intra_mag_list)
+        intra_mag_np = self.data_np[intra_samples.index]
 
         normal_samples = self.dataset_df[(self.dataset_df['dataset'] == dataset) & (self.dataset_df['class_name'] == 'normal')].sample(n=self.averaging_size)
-        normal_mag_list = []
-        for sample in normal_samples['file_path']:
-            interpolated_mag, _, _ = self.open_file(sample)
-            normal_mag_list.append(interpolated_mag)
-        normal_mag_np = np.array(normal_mag_list)
+        normal_mag_np = self.data_np[normal_samples.index]
         
         intra_mean_mag =intra_mag_np.mean(axis=0)
         normal_mean_mag = normal_mag_np.mean(axis=0)
@@ -139,7 +117,7 @@ class OrderFreqDataset(Dataset):
         normalized_mag = smoothed_mag/normal_mean_mag.max()
         normalized_normal_mag = normal_mean_mag/normal_mean_mag.max()
         
-        return normalized_mag, normalized_normal_mag, data_info
+        return normalized_mag, normalized_normal_mag, class_name
     
     def open_file(self, file_path):
     
@@ -186,6 +164,43 @@ class OrderFreqDataset(Dataset):
         interpolated_mag = np.array(interpolated_mag)
 
         return interpolated_mag, interpolated_freq, data_info
+    
+    
+    def load_dataset(self, data_root, cache_dir):
+        
+        data_info_list = []
+        dataset_col = []
+        
+        data_list = []
+
+        for dataset_name in os.listdir(data_root):
+            dataset_dir = os.path.join(data_root, dataset_name)
+            
+            for class_name in os.listdir(dataset_dir):
+                class_dir = os.path.join(dataset_dir, class_name)
+                print(f'processing : {dataset_name} // {class_name}')
+                for file_name in tqdm(os.listdir(class_dir)):
+                    
+                    file_path = os.path.join(class_dir, file_name)
+                    interpolated_mag, interpolated_freq, data_info = self.open_file(file_path)
+                    
+                    data_info_list.append(data_info)
+                    dataset_col.append(dataset_name)
+                    data_list.append(interpolated_mag)
+
+        dataset_df = pd.DataFrame(data_info_list)
+        dataset_df['dataset'] = dataset_col
+        data_np = np.array(data_list)
+        
+        os.makedirs(cache_dir, exist_ok=True)
+        data_cache_path = os.path.join(cache_dir, 'mag.npy')
+        info_cache_path = os.path.join(cache_dir, 'info.csv')
+        
+        dataset_df.to_csv(info_cache_path)
+        np.save(data_cache_path, data_np)
+        
+        self.dataset_df = dataset_df
+        self.data_np = data_np
     
     
 if __name__ == '__main__':
