@@ -1,12 +1,73 @@
 import os
-import pandas as pd
 import random
+
+import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset
-from scipy.fft import fft
-from scipy.interpolate import interp1d
+import lightning as L
+
 import torch
+
+from utils.util import count_classes
+from torch.utils.data import random_split, Dataset, DataLoader
+from scipy.interpolate import interp1d
 from tqdm import tqdm
+
+class LightningDM(L.LightningDataModule):
+    def __init__(self, dataset, classes, batch_size=512, seed=42, splits=[0.7, 0.3], transform = None):
+        super().__init__()
+        self.dataset = dataset
+        self.batch = batch_size
+        self.seed = seed
+        self.splits = splits
+        self.transform = transform
+        self.classes = classes
+    def setup(self, stage: str):
+        if self.transform is not None:
+            print("To Do")
+
+        if len(self.splits) == 2:
+            train_len = int(len(self.dataset) * self.splits[0])
+            val_len = int(len(self.dataset)) - train_len
+        elif len(self.splits) == 3:
+            train_len = int(len(self.dataset) * self.splits[0])
+            val_len = int(len(self.dataset) * self.splits[1])
+            test_len = int(len(self.dataset)) - train_len - val_len
+        else:
+            raise ValueError(f"Invalid length for self.splits: expected 2 or 3, got {len(self.splits)}")
+        print("Start Sampling")
+        if stage == "fit":
+            if len(self.splits) == 2:
+                self.data_train, self.data_val = random_split(
+                    self.dataset, [train_len, val_len]
+                )
+            else:
+                self.data_train, self.data_val, self.data_t = random_split(
+                    self.dataset, [train_len, val_len, test_len]
+                )
+        if stage == "test":
+            if len(self.splits) == 2:
+                self.data_test = self.dataset
+            else:
+                self.data_test = self.data_t
+        if stage == "predict":
+            self.data_predict = self.dataset
+        class_counts = count_classes(self.dataset)
+        num_classes = len(self.classes)
+        counts = np.zeros(num_classes, dtype=np.float32)
+        for class_idx, count in class_counts.items():
+            counts[class_idx] = count
+        epsilon = 1e-8
+        alpha = 1.0 / (counts + epsilon)
+        self.focal_alpha = torch.tensor(alpha, dtype=torch.float32)
+    
+    def train_dataloader(self):
+        return DataLoader(self.data_train, batch_size=self.batch, shuffle=True)
+    def val_dataloader(self):
+        return DataLoader(self.data_val, batch_size=self.batch, shuffle=True)
+    def test_dataloader(self):
+        return DataLoader(self.data_test, batch_size=self.batch)
+    def predict_dataloader(self):
+        return DataLoader(self.data_predict, batch_size=self.batch)
 
 class CachedDataset(Dataset):
     def __init__(self, dataset, cache_path="cached_dataset.pt", force_reload=False):
@@ -48,11 +109,11 @@ class OrderFreqDataset(Dataset):
                 max_order = 10,
                 cache_dir = './cache'):
         
-        self.classes        = classes
+        self.classes = classes
         self.averaging_size = averaging_size
-        self.target_len     = target_len
-        self.sensor_list    = sensor_list
-        self.max_order      = max_order
+        self.target_len = target_len
+        self.sensor_list = sensor_list
+        self.max_order = max_order
         
         data_cache_path = os.path.join(cache_dir, 'mag.npy')
         info_cache_path = os.path.join(cache_dir, 'info.csv')
@@ -75,10 +136,7 @@ class OrderFreqDataset(Dataset):
         return len(self.dataset_df)
         
     def __getitem__(self, index):
-        
-        
         sample_np, normal_np, class_name = self.sampling_smoothing(index)
-        
         
         sample_tensor = torch.tensor(sample_np, dtype=torch.float32)
         normal_tensor = torch.tensor(normal_np, dtype=torch.float32)
@@ -86,9 +144,7 @@ class OrderFreqDataset(Dataset):
         
         return sample_tensor, normal_tensor, class_tensor
         
-        
     def sampling_smoothing(self, index):
-        
         row = self.dataset_df.iloc()[index]
         
         dataset = row['dataset']
@@ -206,10 +262,33 @@ class OrderFreqDataset(Dataset):
 if __name__ == '__main__':
     
     dataset = OrderFreqDataset(
-        data_root= '../dataset'
+        data_root= '/home/data'
     )
 
     sample_tensor, normal_tensor, class_tensor = dataset[0]
     print(f'sample_tensor : {sample_tensor.shape}')
     print(f'normal_tensor : {normal_tensor.shape}')
     print(f'class : {class_tensor}')
+    cached = CachedDataset(dataset=dataset)
+    Ldm = LightningDM(dataset=cached, batch_size=64, seed=42)
+    
+    # # For Cheking DataModule How to use for Each Process
+
+    # # For Training
+    # Ldm.setup(stage='fit')
+    # train_dataloader = Ldm.train_dataloader()
+    # val_dataloader = Ldm.val_dataloader()
+    # print("Train dataloader length: ", len(train_dataloader))
+    # batch = next(iter(train_dataloader))
+    # print(batch[2])
+    # print("Validation dataloader length: ", len(val_dataloader))
+
+    # # For Testing
+    # Ldm.setup(stage='test')
+    # test_dataloader = Ldm.test_dataloader()
+    # print("Test dataloader length: ", len(test_dataloader))
+
+    # # For Predicting
+    # Ldm.setup(stage='predict')
+    # predict_dataloader = Ldm.predict_dataloader()
+    # print("Predict dataloader length: ", len(predict_dataloader))
