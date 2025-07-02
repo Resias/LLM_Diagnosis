@@ -1,11 +1,63 @@
 import os
-import pandas as pd
 import random
+
+import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset
-from scipy.interpolate import interp1d
+import lightning as L
+
 import torch
+
+from torch.utils.data import random_split, Dataset, DataLoader
+from scipy.interpolate import interp1d
 from tqdm import tqdm
+
+class LightningDM(L.LightningDataModule):
+    def __init__(self, dataset, batch_size=512, seed=42, splits=[0.7, 0.3], transform = None):
+        super().__init__()
+        self.dataset = dataset
+        self.batch = batch_size
+        self.seed = seed
+        self.splits = splits
+        self.transform = transform
+    def setup(self, stage: str):
+        if self.transform is not None:
+            print("To Do")
+
+        if len(self.splits) == 2:
+            train_len = int(len(self.dataset) * self.splits[0])
+            val_len = int(len(self.dataset)) - train_len
+        elif len(self.splits) == 3:
+            train_len = int(len(self.dataset) * self.splits[0])
+            val_len = int(len(self.dataset) * self.splits[1])
+            test_len = int(len(self.dataset)) - train_len - val_len
+        else:
+            raise ValueError(f"Invalid length for self.splits: expected 2 or 3, got {len(self.splits)}")
+
+        if stage == "fit":
+            if len(self.splits) == 2:
+                self.data_train, self.data_val = random_split(
+                    self.dataset, [train_len, val_len], generator=torch.Generator().manual_seed(self.seed)
+                )
+            else:
+                self.data_train, self.data_val, self.data_t = random_split(
+                    self.dataset, [train_len, val_len, test_len], generator=torch.Generator().manual_seed(self.seed)
+                )
+        if stage == "test":
+            if len(self.splits) == 2:
+                self.data_test = self.dataset
+            else:
+                self.data_test = self.data_t
+        if stage == "predict":
+            self.data_predict = self.dataset
+    
+    def train_dataloader(self):
+        return DataLoader(self.data_train, batch_size=self.batch)
+    def val_dataloader(self):
+        return DataLoader(self.data_val, batch_size=self.batch)
+    def test_dataloader(self):
+        return DataLoader(self.data_test, batch_size=self.batch)
+    def predict_dataloader(self):
+        return DataLoader(self.data_predict, batch_size=self.batch)
 
 class CachedDataset(Dataset):
     def __init__(self, dataset, cache_path="cached_dataset.pt", force_reload=False):
@@ -212,3 +264,28 @@ if __name__ == '__main__':
     print(f'sample_tensor : {sample_tensor.shape}')
     print(f'normal_tensor : {normal_tensor.shape}')
     print(f'class : {class_tensor}')
+    cached = CachedDataset(dataset=dataset)
+    Ldm = LightningDM(dataset=cached, batch_size=64, seed=42)
+    
+    # For Cheking DataModule How to use for Each Process
+
+    # For Training
+
+    # Ldm.setup(stage='fit')
+    # train_dataloader = Ldm.train_dataloader()
+    # val_dataloader = Ldm.val_dataloader()
+    # print("Train dataloader length: ", len(train_dataloader))
+    # print("Validation dataloader length: ", len(val_dataloader))
+
+
+    # For Testing
+    
+    # Ldm.setup(stage='test')
+    # test_dataloader = Ldm.test_dataloader()
+    # print("Test dataloader length: ", len(test_dataloader))
+
+    # For Predicting
+    
+    # Ldm.setup(stage='predict')
+    # predict_dataloader = Ldm.predict_dataloader()
+    # print("Predict dataloader length: ", len(predict_dataloader))
