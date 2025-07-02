@@ -1,8 +1,7 @@
 data/__pycache__/
-dataset/
-.DS_Store
 models/__pycache__/
-cached/
+cache/
+cached_dataset.pt
+.DS_Store
 results/
 *.ipynb
-cache/
