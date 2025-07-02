@@ -53,10 +53,8 @@ class SegmentClassifier(nn.Module):
             nn.Linear(128, num_classes),
             nn.Softmax(-1)
         )
-
     def forward(self, x):
         return self.fc(x)
-
 
 class SegmentLevelModel(nn.Module):
     def __init__(self, embed_dim=64, n_heads=4, num_segments=10, num_classes=4, seg_len=26):

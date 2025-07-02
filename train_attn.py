@@ -7,13 +7,12 @@ from tqdm import tqdm
 
 
 if __name__ == '__main__':
-    
     batch_size = 32
     num_epoch = 10
     device = 'cuda'
     
     dataset = OrderFreqDataset(
-        data_root= '/workspace/vms_dataset', 
+        data_root= '/data/vms_dataset', 
         classes = ['normal', 'looseness', 'misalignment', 'unbalance', 'bearing'], 
         averaging_size = 100, 
         target_len=260, 
@@ -27,7 +26,6 @@ if __name__ == '__main__':
         num_segments=10,
         num_classes=5
     ).to(device)
-    
     
     data_loader = DataLoader(dataset,
                             batch_size=batch_size,
