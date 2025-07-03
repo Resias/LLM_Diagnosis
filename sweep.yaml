@@ -1,0 +1,17 @@
+# sweep.yaml
+program : train_attn_w_trainer.py
+name: sweep for model find
+description: Finding model parameteres
+project: LLM_PHM
+method: bayes  # 또는 grid, random
+metric:
+  name: valid/F1_score
+  goal: maximize
+
+parameters:
+  batch_size:
+    values: [32, 64, 128, 256]
+  embed_dim:
+    values: [32, 64, 128, 256]
+  n_heads:
+    values: [4, 8, 16]
