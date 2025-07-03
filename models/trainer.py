@@ -212,5 +212,8 @@ class LightningMD(L.LightningModule):
                     f"{step_name}_{key}_idx{idx}_pred{pred_classes[idx]}_true{true_labels[idx]}_step{logger_step}"
                 )
 
-                wandb.log({f"{step_name}/{key}_idx{idx}_heatmap": wandb.Image(plt.gcf())}, step=logger_step)
-                plt.close()
+                if hasattr(self.logger, "experiment"):
+                    self.logger.experiment.log({
+                        f"{step_name}/{key}_idx{idx}_heatmap": wandb.Image(plt.gcf())
+                    }, step=logger_step)
+                    plt.close()
