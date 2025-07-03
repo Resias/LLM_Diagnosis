@@ -84,6 +84,7 @@ class LightningMD(L.LightningModule):
             
             # Scheduler (매 step마다 step 하거나 조건 걸기)
             lr_scheduler_model.step()
+        self.log(f"train/loss", loss, sync_dist=True)
         
         return loss
     
@@ -108,6 +109,7 @@ class LightningMD(L.LightningModule):
 
         self.y_valid_true.extend(y.cpu().numpy())
         self.y_valid_pred.extend(torch.argmax(pred, dim=1).cpu().numpy())
+        self.log(f"valid/loss", loss, sync_dist=True)
         return loss
     
     def test_step(self, batch, batch_idx):
@@ -131,6 +133,7 @@ class LightningMD(L.LightningModule):
 
         self.y_test_true.extend(y.cpu().numpy())
         self.y_test_pred.extend(torch.argmax(pred, dim=1).cpu().numpy())
+        self.log(f"test/loss", loss, sync_dist=True)
         return loss
 
     def on_train_epoch_end(self):
