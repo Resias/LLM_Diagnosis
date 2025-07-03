@@ -25,7 +25,7 @@ class LightningMD(L.LightningModule):
         self.y_valid_true, self.y_valid_pred = [], []
         self.y_test_true, self.y_test_pred = [], []
         self.first_val_step = True
-        self.automatic_optimization = False
+        self.automatic_optimization = True
         self.save_hyperparameters()
 
         
@@ -68,24 +68,7 @@ class LightningMD(L.LightningModule):
 
         self.y_train_true.extend(y.cpu().numpy())
         self.y_train_pred.extend(torch.argmax(pred, dim=1).cpu().numpy())
-        
-        if not self.automatic_optimization:
-            opt_model = self.optimizers()
-            lr_scheduler_model = self.lr_schedulers()
-            
-            # 1. Zero grad
-            opt_model.zero_grad()
-
-            # 2. Backward
-            self.manual_backward(loss)
-
-            # 3. Step
-            opt_model.step()
-            
-            # Scheduler (매 step마다 step 하거나 조건 걸기)
-            lr_scheduler_model.step()
         self.log(f"train/loss", loss, sync_dist=True)
-        
         return loss
     
     def validation_step(self, batch, batch_idx):
