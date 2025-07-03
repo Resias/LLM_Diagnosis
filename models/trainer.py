@@ -193,7 +193,11 @@ class LightningMD(L.LightningModule):
         step_name: "train", "valid", "test"
         logger_step: 현재 step
         """
-
+        max_epochs = self.trainer.max_epochs if hasattr(self.trainer, "max_epochs") else 300
+        allowed_epochs = [0, max_epochs // 2, max_epochs - 1]
+        if self.current_epoch not in allowed_epochs:
+            return
+        
         attn_keys = ["sample_attn_scores", "normal_attn_scores", "cross_attn_scores"]
         B = preds.shape[0]
         idx_list = self.select_random_indices(B, num_samples=num_samples)
@@ -211,9 +215,13 @@ class LightningMD(L.LightningModule):
                 plt.title(
                     f"{step_name}_{key}_idx{idx}_pred{pred_classes[idx]}_true{true_labels[idx]}_step{logger_step}"
                 )
+                
+                # 🟩 wandb.Image에 caption으로 결과 연동하여 가독성 향상
+                caption = f"{step_name} | {key} | idx: {idx} | pred: {pred_classes[idx]} | true: {true_labels[idx]} | step: {logger_step} | epoch: {self.current_epoch}"
+
 
                 if hasattr(self.logger, "experiment"):
                     self.logger.experiment.log({
                         f"{step_name}/{key}_idx{idx}_heatmap": wandb.Image(plt.gcf())
                     }, step=logger_step)
-                    plt.close()
+                plt.close()
