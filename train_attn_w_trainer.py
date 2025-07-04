@@ -42,7 +42,7 @@ def get_args():
     parser.add_argument('--n_segments', type=int, help='model num of segments', default=10)
     # Training Settings
     parser.add_argument('--fast_dev_run', type=bool, help='pytorch lightning fast_dev_run', default=False)
-    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=300)
+    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=100)
     return parser.parse_args()
 
 
