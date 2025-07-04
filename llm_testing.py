@@ -1,5 +1,5 @@
 import torch
-
+import os
 from torch.utils.data import Dataset
 from data.order_dataset import ExtendedOrderFreqDataset
 
@@ -8,12 +8,31 @@ from peft import get_peft_model, LoraConfig, TaskType
 
 from trl import GRPOTrainer, GRPOConfig
 from utils.reward import reward_format, reward_accuracy
-
+from langchain_community.document_loaders import PyMuPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
 
 # Dataset
 class VibrationSFTDatasetEnglish(Dataset):
-    def __init__(self, vibration_dataset):
+    def __init__(self, vibration_dataset, pdf_folder_path):
+
         self.vibration_dataset = vibration_dataset
+
+        pdf_files = [os.path.join(pdf_folder_path, f) for f in os.listdir(pdf_folder_path) if f.endswith(".pdf")]
+        documents = []
+        for pdf_file in pdf_files:
+            loader = PyMuPDFLoader(pdf_file)
+            documents.extend(loader.load())
+
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=50)
+        docs = text_splitter.split_documents(documents)
+
+        embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3", model_kwargs={"device":"cuda"}, encode_kwargs={"normalize_embeddings":True})
+        persist_directory = os.path.join(pdf_folder_path, "vectorstore")
+        vectorstore = Chroma.from_documents(documents=docs, embedding=embeddings, persist_directory=persist_directory)
+        self.retriever = vectorstore.as_retriever(search_kwargs={"k":3})
+        self.format_docs = lambda docs: "\n\n".join([d.page_content for d in docs])
 
     def __len__(self):
         return len(self.vibration_dataset)
@@ -31,16 +50,32 @@ class VibrationSFTDatasetEnglish(Dataset):
         )
 
         user_prompt = (
-            "Act as an expert in vibration-based diagnosis of rotating machinery. "
-            "Analyze the order frequency description of both the normal and current vibration signals I provide, "
-            "and accurately diagnose the current condition of the equipment. "
-            "Possible diagnostic classes are: looseness, normal, unbalance, misalignment, bearing."
-            
+            "Use the following relevant literature summaries to inform your analysis:\n"
+            f"{''}\n\n"
+            "You are an expert in vibration-based diagnosis of rotating machinery. "
+            "Given the order frequency statistical descriptions for both the normal and current vibration signals, "
+            "provide a concise diagnosis. Possible conditions: looseness, normal, unbalance, misalignment, bearing.\n\n"
             f"Normal state (x-axis): {description_normal[0]}\n"
             f"Normal state (y-axis): {description_normal[1]}\n"
             f"Current state (x-axis): {description_sample[0]}\n"
             f"Current state (y-axis): {description_sample[1]}\n"
-            "Diagnose condition: looseness, normal, unbalance, misalignment, bearing."
+        )
+
+        # Retrieve RAG context based on full prompt
+        rag_docs = self.retriever.get_relevant_documents(user_prompt)
+        rag_context = self.format_docs(rag_docs)
+
+        # Update user_prompt with retrieved context
+        user_prompt = (
+            "Use the following relevant literature summaries to inform your analysis:\n"
+            f"{rag_context}\n\n"
+            "You are an expert in vibration-based diagnosis of rotating machinery. "
+            "Given the order frequency statistical descriptions for both the normal and current vibration signals, "
+            "provide a concise diagnosis. Possible conditions: looseness, normal, unbalance, misalignment, bearing.\n\n"
+            f"Normal state (x-axis): {description_normal[0]}\n"
+            f"Normal state (y-axis): {description_normal[1]}\n"
+            f"Current state (x-axis): {description_sample[0]}\n"
+            f"Current state (y-axis): {description_sample[1]}\n"
         )
 
         # Generate a detailed CoT reasoning string emphasizing <VIB_EMB>
@@ -77,8 +112,8 @@ if __name__ == '__main__':
     llm = get_peft_model(llm, peft_config)
 
 
-    dataset = VibrationSFTDatasetEnglish(tokenizer, vibration_dataset)
-    
+    dataset = VibrationSFTDatasetEnglish(vibration_dataset, pdf_folder_path='./pdf')
+
     # 3. Configure training
     training_args = GRPOConfig(
         output_dir="output"
