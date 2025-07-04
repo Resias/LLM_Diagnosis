@@ -193,8 +193,8 @@ class LightningMD(L.LightningModule):
         step_name: "train", "valid", "test"
         logger_step: 현재 step
         """
-        max_epochs = self.trainer.max_epochs if hasattr(self.trainer, "max_epochs") else 300
-        allowed_epochs = [0, max_epochs // 2, max_epochs - 1]
+        max_epochs = self.trainer.max_epochs if hasattr(self.trainer, "max_epochs") else 100
+        allowed_epochs = [0, max_epochs//4, max_epochs // 2, max_epochs//2 + max_epochs//4, max_epochs - 1]
         if self.current_epoch not in allowed_epochs:
             return
         
@@ -212,16 +212,25 @@ class LightningMD(L.LightningModule):
                 plt.figure(figsize=(5, 5))
                 plt.imshow(attn_map, cmap="viridis")
                 plt.colorbar()
+
+                plt.xticks(ticks=np.arange(0, 10), labels=np.arange(1, 11))
+                plt.yticks(ticks=np.arange(0, 10), labels=np.arange(1, 11))
+
+                
+                if key == "cross_attn_scores":
+                    plt.xlabel("Key/Value (1~10)")
+                    plt.ylabel("Query (1~10)")
+                
                 plt.title(
-                    f"{step_name}_{key}_idx{idx}_pred{pred_classes[idx]}_true{true_labels[idx]}_step{logger_step}"
+                    f"{key}_pred{pred_classes[idx]}_true{true_labels[idx]}"
                 )
                 
                 # 🟩 wandb.Image에 caption으로 결과 연동하여 가독성 향상
-                caption = f"{step_name} | {key} | idx: {idx} | pred: {pred_classes[idx]} | true: {true_labels[idx]} | step: {logger_step} | epoch: {self.current_epoch}"
+                caption = f"{step_name} | {key} | pred: {pred_classes[idx]} | true: {true_labels[idx]} | epoch: {self.current_epoch}"
 
 
                 if hasattr(self.logger, "experiment"):
                     self.logger.experiment.log({
-                        f"{step_name}/{key}_idx{idx}_heatmap": wandb.Image(plt.gcf())
-                    }, step=logger_step)
+                        f"{step_name}/{key}_heatmap": wandb.Image(plt.gcf(), caption=caption)
+                    })
                 plt.close()
