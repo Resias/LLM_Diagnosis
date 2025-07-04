@@ -10,6 +10,8 @@ import torch
 from utils.util import count_classes
 from torch.utils.data import random_split, Dataset, DataLoader
 from scipy.interpolate import interp1d
+from scipy.stats import skew, kurtosis
+import numpy as np
 from tqdm import tqdm
 
 class LightningDM(L.LightningDataModule):
@@ -258,7 +260,56 @@ class OrderFreqDataset(Dataset):
         self.dataset_df = dataset_df
         self.data_np = data_np
     
-    
+# ExtendedOrderFreqDataset subclass
+class ExtendedOrderFreqDataset(OrderFreqDataset):
+    """
+    Subclass of OrderFreqDataset that overrides __getitem__
+    to return per-segment statistical descriptions.
+    """
+    def __getitem__(self, index):
+        # get normalized magnitude and normal mean from parent
+        sample_np, normal_np, class_name = super().sampling_smoothing(index)
+        
+        seg_len = self.target_len // self.max_order
+        C, T = sample_np.shape
+        assert T % seg_len == 0, f"Time dimension {T} is not divisible by seg_len={seg_len}"
+        N = T // seg_len
+        
+        # reshape into (C, N, seg_len)
+        seg_sample = sample_np.reshape(C, N, seg_len)
+        seg_normal = normal_np.reshape(C, N, seg_len)
+        
+        description_sample = []
+        description_normal = []
+        for ch in range(C):
+            description_ch_sample = {}
+            description_ch_normal = {}
+            for order in range(N):
+                segment_sample = seg_sample[ch, order]
+                features_sample = {
+                    'kurtosis': round(kurtosis(segment_sample, fisher=True), 2),
+                    'skewness': round(skew(segment_sample), 2),
+                    'median': round(np.median(segment_sample), 2),
+                    'min': round(np.min(segment_sample), 2),
+                    'max': round(np.max(segment_sample), 2),
+                }
+                segment_normal = seg_normal[ch, order]
+                features_normal = {
+                    'kurtosis': round(kurtosis(segment_normal, fisher=True), 2),
+                    'skewness': round(skew(segment_normal), 2),
+                    'median': round(np.median(segment_normal), 2),
+                    'min': round(np.min(segment_normal), 2),
+                    'max': round(np.max(segment_normal), 2),
+                }
+                band_key = f'{order+1}x Frequency Band'
+                description_ch_sample[band_key] = features_sample
+                description_ch_normal[band_key] = features_normal
+            description_sample.append(description_ch_sample)
+            description_normal.append(description_ch_normal)
+        
+        return description_sample, description_normal, class_name
+
+
 if __name__ == '__main__':
     
     dataset = OrderFreqDataset(
