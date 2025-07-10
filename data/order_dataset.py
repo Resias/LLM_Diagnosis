@@ -320,8 +320,8 @@ if __name__ == '__main__':
     print(f'sample_tensor : {sample_tensor.shape}')
     print(f'normal_tensor : {normal_tensor.shape}')
     print(f'class : {class_tensor}')
-    cached = CachedDataset(dataset=dataset)
-    Ldm = LightningDM(dataset=cached, batch_size=64, seed=42)
+    # cached = CachedDataset(dataset=dataset)
+    # Ldm = LightningDM(dataset=cached, batch_size=64, seed=42)
     
     # # For Cheking DataModule How to use for Each Process
 

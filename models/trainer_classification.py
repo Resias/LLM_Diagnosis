@@ -193,7 +193,7 @@ class LightningMD(L.LightningModule):
         step_name: "train", "valid", "test"
         logger_step: 현재 step
         """
-        max_epochs = self.trainer.max_epochs if hasattr(self.trainer, "max_epochs") else 100
+        max_epochs = self.trainer.max_epochs if hasattr(self.trainer, "max_epochs") else 50
         allowed_epochs = [0, max_epochs//4, max_epochs // 2, max_epochs//2 + max_epochs//4, max_epochs - 1]
         if self.current_epoch not in allowed_epochs:
             return

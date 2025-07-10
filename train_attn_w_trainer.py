@@ -11,7 +11,8 @@ from lightning.pytorch.strategies import DDPStrategy
 
 from data.order_dataset import OrderFreqDataset, CachedDataset, LightningDM
 from models.segment_transformer import SegmentLevelModel
-from models.trainer import LightningMD
+from models.trainer_classification import LightningMD
+import wandb
 
 
 def get_args():
@@ -22,7 +23,7 @@ def get_args():
 
     # Datset Settings
     parser.add_argument('--use_cache', type=int, help='use cached dataset', choices=[0, 1], default=1)
-    parser.add_argument('--dataset_root', type=str, help='for raw data csv root', default='/home/data')
+    parser.add_argument('--dataset_root', type=str, help='for raw data csv root', default='/workspace/vms_dataset')
     parser.add_argument('--classes', type=list, help='classes for training', default=['normal', 'looseness', 'misalignment', 'unbalance', 'bearing'])
     parser.add_argument('--average_size', type=int, help='average smoothing size', default=100)
     parser.add_argument('--target_length', type=int, help='data shape for final length', default=260)
@@ -42,7 +43,7 @@ def get_args():
     parser.add_argument('--n_segments', type=int, help='model num of segments', default=10)
     # Training Settings
     parser.add_argument('--fast_dev_run', type=bool, help='pytorch lightning fast_dev_run', default=False)
-    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=100)
+    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=50)
     return parser.parse_args()
 
 
@@ -149,4 +150,5 @@ if __name__ == '__main__':
     save_path = os.path.join('model_saved')
     os.makedirs(save_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(save_path, model_filename))
+    wandb.finish()
     
