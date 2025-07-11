@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
+from models.segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
 
 
 class ResidualSegmentSelfAttention(nn.Module):
@@ -48,7 +48,7 @@ class DecoderBlock1D(nn.Module):
         return out  # (B, out_ch, L')   
 
 
-class FFTMultiTaskModel(nn.Module):
+class SegmentReconModel(nn.Module):
     def __init__(
         self,
         embed_dim: int = 64,
@@ -71,23 +71,19 @@ class FFTMultiTaskModel(nn.Module):
         ])
 
         # 2) 재구성 디코더 (reconstruction head)
+        channels = [embed_dim] + [embed_dim // 2] * (n_dec_layers - 2) + [2]
         self.dec_blocks = nn.ModuleList()
-        # upsample block (embed_dim→embed_dim)
-        self.dec_blocks.append(
-            DecoderBlock1D(embed_dim, embed_dim,
-                                kernel_size=seg_len, stride=seg_len)
-        )
-        # 중간 블록 (채널 축소)
-        for _ in range(n_dec_layers-2):
+        prev_ch = embed_dim
+        for i, out_ch in enumerate(channels):
+            # 첫 블록만 세그먼트 길이만큼 업샘플
+            if i == 0:
+                ks, st = seg_len, seg_len
+            else:
+                ks, st = 1, 1
             self.dec_blocks.append(
-                DecoderBlock1D(embed_dim, embed_dim//2,
-                                    kernel_size=1, stride=1)
+                DecoderBlock1D(prev_ch, out_ch, kernel_size=ks, stride=st)
             )
-        # 마지막 블록 (embed_dim//2→2)
-        self.dec_blocks.append(
-            DecoderBlock1D(embed_dim//2, 2,
-                                kernel_size=1, stride=1)
-        )
+            prev_ch = out_ch
 
         self.cross_attn = SegmentCrossAttention(embed_dim, n_heads)
         # 3) 분류 헤드 (classification head)
@@ -141,7 +137,11 @@ class FFTMultiTaskModel(nn.Module):
                 "normal_attn_scores_list": normal_scores_list,
                 "cross_attn_scores": cross_scores
             }
-        return recon
+        return recon, {
+                "sample_attn_scores_list": sample_scores_list,
+                "normal_attn_scores_list": normal_scores_list,
+                "cross_attn_scores": None
+            }
 
 
 # ---------------------------
@@ -154,7 +154,7 @@ if __name__ == "__main__":
     # 더미 레이블: 분류용
     dummy_y = torch.randint(0, 4, (4,))
 
-    model = FFTMultiTaskModel(
+    model = SegmentReconModel(
         embed_dim=64,
         n_heads=4,
         n_enc_layers=3,
