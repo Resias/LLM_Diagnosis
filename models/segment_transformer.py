@@ -20,7 +20,6 @@ class SegmentEmbedder(nn.Module):
         out = out.reshape(B, S, -1)   # → (B, 10, embed_dim)
         return out
 
-
 class SegmentSelfAttention(nn.Module):
     def __init__(self, embed_dim, n_heads):
         super().__init__()
@@ -31,7 +30,6 @@ class SegmentSelfAttention(nn.Module):
         out, attn_weights = self.attn(x, x, x, need_weights=True)
         return out, attn_weights  # (B, 10, D), (B, 10, 10)
 
-
 class SegmentCrossAttention(nn.Module):
     def __init__(self, embed_dim, n_heads):
         super().__init__()
@@ -41,7 +39,6 @@ class SegmentCrossAttention(nn.Module):
         # query: (B, 10, D), keyval: (B, 10, D)
         out, attn_weights = self.attn(query, keyval, keyval, need_weights=True)
         return out, attn_weights  # (B, 10, D), (B, 10, 10)
-
 
 class SegmentClassifier(nn.Module):
     def __init__(self, embed_dim, num_segments, num_classes):
@@ -66,7 +63,6 @@ class SegmentLevelModel(nn.Module):
         self.classifier = SegmentClassifier(embed_dim, num_segments, num_classes)
 
     def forward(self, x_sample, x_normal):
-
         seg_sample = x_sample.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
         seg_normal = x_normal.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
 

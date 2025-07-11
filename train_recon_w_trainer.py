@@ -10,15 +10,15 @@ from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.strategies import DDPStrategy
 
 from data.order_dataset import OrderFreqDataset, CachedDataset, LightningDM
-from models.segment_transformer import SegmentLevelModel
-from models.trainer_classification import LightningMD
+from models.segment_transformer_recon import SegmentReconModel
+from models.trainer_recon_classify import LightningReconClassifyMD
 import wandb
 
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train Config")
     # Wandb Settings
-    parser.add_argument('--project_name', type=str, help='Wandb project Name', default='LLM_PHM')
+    parser.add_argument('--project_name', type=str, help='Wandb project Name', default='LLM_PHM_recon')
     parser.add_argument('--run_name', type=str, help='Wandb experiments Name', default=None)
 
     # Datset Settings
@@ -36,19 +36,26 @@ def get_args():
     parser.add_argument('--batch_size', type=int, help='batch size', default=512)
     parser.add_argument('--seed', type=int, help='seed', default=42)
     parser.add_argument('--data_splits_ratio', type=list, help='train, validation or plus test dataset ratio', default=[0.7, 0.3])
+    parser.add_argument('--training_mode', type=str, help='for training mode', default='recon_only') # 'recon_classify' or 'recon_only'
     parser.add_argument('--class_loss', type=str, help='for classification loss', default='focal')
+    parser.add_argument('--recon_loss', type=str, help='for reconstruction loss', default='mse')
+    parser.add_argument('--loss_alpha', type=float, help='for classification loss alpha', default=0.5)
     # Model Settings
     parser.add_argument('--embed_dim', type=int, help='model embed dimension', default=64)
     parser.add_argument('--n_heads', type=int, help='model num of heads', default=4)
+    parser.add_argument('--n_enc_layers', type=int, help='model num of encoder layer', default=3)
+    parser.add_argument('--n_dec_layers', type=int, help='model num of decoder layer', default=3)
     parser.add_argument('--n_segments', type=int, help='model num of segments', default=10)
+    parser.add_argument('--num_classes', type=int, help='model num of classes', default=4)
     # Training Settings
     parser.add_argument('--fast_dev_run', type=bool, help='pytorch lightning fast_dev_run', default=False)
-    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=50)
+    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=100)
     return parser.parse_args()
 
 
+
 def get_dataset(args, stage: str):
-    num_workers = min(4, os.cpu_count() // 2)
+    num_workers = min(2, os.cpu_count() // 2)
     
     preprocess_dataset = OrderFreqDataset(
         data_root= args.dataset_root, 
@@ -77,15 +84,20 @@ def get_dataset(args, stage: str):
     return dm, focal_alpha
     
 def get_model(args, focal_alpha=None):
-    model = SegmentLevelModel(
+    model = SegmentReconModel(
         embed_dim = args.embed_dim,
         n_heads = args.n_heads,
+        n_enc_layers = args.n_enc_layers,
+        n_dec_layers = args.n_dec_layers,
         num_segments = args.n_segments,
         num_classes = len(args.classes)
     )
-    Lmd = LightningMD(
+    Lmd = LightningReconClassifyMD(
         model = model,
+        training_mode = args.training_mode,
+        recon_loss = args.recon_loss,
         class_loss = args.class_loss,
+        loss_alpha = args.loss_alpha,
         focal_alpha = focal_alpha,
         classes = args.classes
     )
@@ -107,7 +119,7 @@ if __name__ == '__main__':
     # WandB Logger 설정
     if args.run_name is None:
         now = time.localtime()
-        name = f'M{now.tm_mon}_D{now.tm_mday}_ed{args.embed_dim}_nh{args.n_heads}'
+        name = f'MD_{now.tm_mon}{now.tm_mday}_ed{args.embed_dim}_nh{args.n_heads}_nd{args.n_dec_layers}_ne{args.n_enc_layers}'
     else:
         name = args.run_name
 
@@ -119,7 +131,7 @@ if __name__ == '__main__':
         config = vars(args)
     )
     if num_gpus >= 2:
-        strategy = DDPStrategy(find_unused_parameters=False)
+        strategy = DDPStrategy(find_unused_parameters=True)
         accelerator = 'gpu'
         devices = num_gpus
     elif num_gpus == 1:
@@ -145,10 +157,9 @@ if __name__ == '__main__':
     trainer.fit(model, datamodule=datamodule)
     trainer.validate(model, dataloaders=datamodule)
     
-    saved_model_name = f'M{now.tm_mon}_D{now.tm_mday}_ed{args.embed_dim}_nh{args.n_heads}'
+    saved_model_name = f'MD_{now.tm_mon}{now.tm_mday}_ed{args.embed_dim}_nh{args.n_heads}_nd{args.n_dec_layers}_ne{args.n_enc_layers}'
     model_filename = f'{saved_model_name}_model.pth'
     save_path = os.path.join('model_saved')
     os.makedirs(save_path, exist_ok=True)
     torch.save(model.state_dict(), os.path.join(save_path, model_filename))
     wandb.finish()
-    
