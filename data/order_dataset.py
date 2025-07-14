@@ -137,12 +137,15 @@ class OrderFreqDataset(Dataset):
     def __len__(self):
         return len(self.dataset_df)
         
-    def __getitem__(self, index):
-        sample_np, normal_np, class_name = self.sampling_smoothing(index)
+    def __getitem__(self, index, data_info=False):
+        sample_np, normal_np, class_name, row = self.sampling_smoothing(index)
         
         sample_tensor = torch.tensor(sample_np, dtype=torch.float32)
         normal_tensor = torch.tensor(normal_np, dtype=torch.float32)
         class_tensor = torch.tensor(self.classes.index(class_name), dtype=torch.long)
+        
+        if data_info:
+            return sample_tensor, normal_tensor, row
         
         return sample_tensor, normal_tensor, class_tensor
         
@@ -175,7 +178,7 @@ class OrderFreqDataset(Dataset):
         normalized_mag = smoothed_mag/normal_mean_mag.max()
         normalized_normal_mag = normal_mean_mag/normal_mean_mag.max()
         
-        return normalized_mag, normalized_normal_mag, class_name
+        return normalized_mag, normalized_normal_mag, class_name, row
     
     def open_file(self, file_path):
     
