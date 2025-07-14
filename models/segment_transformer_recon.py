@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
+from models.segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
 
 
 class ResidualSegmentSelfAttention(nn.Module):
@@ -62,7 +62,7 @@ class SegmentReconModel(nn.Module):
         super().__init__()
         self.num_segments = num_segments
         self.seg_len = seg_len
-
+        self.embed_dim = embed_dim
         # 1) 공유 인코더
         self.embedder = SegmentEmbedder(embed_dim)
         self.enc_layers = nn.ModuleList([

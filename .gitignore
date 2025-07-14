@@ -1,6 +1,7 @@
 data/__pycache__/
 models/__pycache__/
 utils/__pycache__/
+cache_models/
 model_saved/
 cache/
 cached_dataset.pt
