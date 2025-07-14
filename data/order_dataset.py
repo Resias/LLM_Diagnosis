@@ -132,6 +132,10 @@ class OrderFreqDataset(Dataset):
                 data_root=data_root,
                 cache_dir=cache_dir
             )
+            
+        dataset_mask = self.dataset_df['dataset'].isin(dataset_list)
+        self.dataset_df = self.dataset_df[dataset_mask].reset_index()
+        self.data_np = self.data_np[dataset_mask]
         
         
     def __len__(self):

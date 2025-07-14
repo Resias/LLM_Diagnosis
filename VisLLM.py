@@ -339,25 +339,14 @@ if __name__ == '__main__':
     
     device = 'cuda'
     
-    vibration_dataset = OrderFreqDataset(
-        data_root = '/workspace/dataset', 
-        classes = ['normal', 'looseness', 'misalignment', 'unbalance', 'bearing'], 
-        dataset_list = ['dxai', 'mfd', 'vat', 'vbl'],
-        averaging_size = 100, 
-        target_len=260, 
-        sensor_list=['motor_x', 'motor_y'], 
-        max_order = 10,
-        cache_dir = './cache'
-    )
+    #승하가 학습시킨 모델 가중치 로드할 수 있도록 변경
     vib_encoder = SegmentReconModel().to(device)
-    
     
     model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     tokenizer = AutoTokenizer.from_pretrained(model_name,
                                               cache_dir='./cache_models/r1')
     llm = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16,
                                                  cache_dir='./cache_models/r1').to(device)
-    
     peft_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=16,
@@ -367,46 +356,56 @@ if __name__ == '__main__':
     )
     llm = get_peft_model(llm, peft_config)
     
+    
     special_tokens = {
     'additional_special_tokens': ["<NORMAL_VIB_EMB>", "<CURRENT_VIB_EMB>"]
     }
     tokenizer.add_special_tokens(special_tokens)
     llm.resize_token_embeddings(len(tokenizer))
     
-    vibration_llm_dataset = VibrationSFTDatasetEnglish(
-        vibration_dataset=vibration_dataset,
+    train_orderdatsaet = OrderFreqDataset(
+                data_root = '/workspace/dataset', 
+                dataset_list = ['dxai', 'mfd', 'vbl'],
+    )
+    trainset = VibrationSFTDatasetEnglish(
+        vibration_dataset=train_orderdatsaet,
+        vib_encoder = vib_encoder,
+        embedding_dim = llm.config.hidden_size
+    )
+    val_orderdatsaet = OrderFreqDataset(
+                data_root = '/workspace/dataset', 
+                dataset_list = ['vat'],
+    )
+    valset = VibrationSFTDatasetEnglish(
+        vibration_dataset=val_orderdatsaet,
         vib_encoder = vib_encoder,
         embedding_dim = llm.config.hidden_size
     )
     
-    # 3. Configure training
+
     training_args = GRPOConfig(
         output_dir="output",
-        learning_rate=1e-5,
         logging_strategy="steps",
         logging_steps=10,
         report_to="wandb",
     )
-
-    # 4. Initialize and train
     trainer = CustomGRPOTRainer(
         model=llm,
         processing_class=tokenizer,
         args=training_args,
-        train_dataset=vibration_llm_dataset,
+        train_dataset=trainset,
+        eval_dataset=valset,
         reward_funcs=[reward_format, reward_accuracy],
     )
 
-    # Ensure vib_encoder and vib_tokenizer.model are included in training
-    for name, param in vibration_llm_dataset.vib_tokenizer.vib_encoder.named_parameters():
+    for name, param in trainset.vib_tokenizer.vib_encoder.named_parameters():
         if param.requires_grad:
             print(f"[ENCODER] Trainable: {name}")
-    for name, param in vibration_llm_dataset.vib_tokenizer.model.named_parameters():
+    for name, param in trainset.vib_tokenizer.model.named_parameters():
         if param.requires_grad:
             print(f"[VIB_EMBEDDING] Trainable: {name}")
 
-    # Define optimizer using only parameters with requires_grad=True
-    vib_embedder = vibration_llm_dataset.vib_tokenizer
+    vib_embedder = trainset.vib_tokenizer
     model = trainer.model
     learning_rate = training_args.learning_rate
     params = list(filter(lambda p: p.requires_grad, vib_embedder.parameters())) + \
