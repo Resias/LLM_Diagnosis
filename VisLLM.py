@@ -3,8 +3,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from typing import Any, Callable, Optional, Union
-from accelerate.utils import broadcast_object_list, gather, gather_object, is_peft_model, set_seed
+from typing import Any, Union
+from accelerate.utils import gather_object
 from trl.data_utils import maybe_apply_chat_template
 import re
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -12,12 +12,13 @@ from contextlib import nullcontext
 from data.order_dataset import OrderFreqDataset
 from models.segment_transformer_recon import SegmentReconModel
 
-from torch.optim import AdamW
 from trl.models import unwrap_model_for_generation
-
 from trl import GRPOTrainer, GRPOConfig
 from peft import get_peft_model, LoraConfig, TaskType
 from utils.reward import reward_format, reward_accuracy
+
+import wandb
+from html import escape
 
 class VibEmbedding(nn.Module):
     def __init__(self, vib_encoder, token_embed_dim, freeze_encoder=True):
@@ -55,7 +56,6 @@ class VibrationSFTDatasetEnglish(Dataset):
             vib_encoder = vib_encoder,
             token_embed_dim=embedding_dim
         )
-
 
     def __len__(self):
         return len(self.vibration_dataset)
@@ -116,6 +116,9 @@ def nanstd(tensor: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(variance)
 
 class CustomGRPOTRainer(GRPOTrainer):
+    """
+    GRPO에 custom multi-modal 기능이 없어 구현
+    """
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -163,7 +166,6 @@ class CustomGRPOTRainer(GRPOTrainer):
         ):
             # Prepare input embeddings and replace special tokens with vibration embeddings
             prompt_ids = prompt_ids.to(self.model.device)
-
             input_embeddings = self.model.get_input_embeddings()(prompt_ids.clone())
             prompt_mask = prompt_mask.to(self.model.device)
 
@@ -171,15 +173,29 @@ class CustomGRPOTRainer(GRPOTrainer):
                 n_pos = (prompt_ids[i] == normal_id).nonzero(as_tuple=False)
                 c_pos = (prompt_ids[i] == current_id).nonzero(as_tuple=False)
  
-                if n_pos.numel() > 0:
-                    input_embeddings[i, n_pos.item()] = inputs[i]['normal_token'].to(input_embeddings.device)
-                if c_pos.numel() > 0:
-                    input_embeddings[i, c_pos.item()] = inputs[i]['currnet_token'].to(input_embeddings.device)
+                input_embeddings[i, n_pos.item()] = inputs[i]['normal_token'].to(input_embeddings.device)
+                input_embeddings[i, c_pos.item()] = inputs[i]['currnet_token'].to(input_embeddings.device)
 
             
             prompt_completion_ids = unwrapped_model.generate(
                 inputs_embeds=input_embeddings, attention_mask=prompt_mask, generation_config=self.generation_config
             )
+
+            # Log one example to wandb as HTML every 100 steps
+            if self.state.global_step % 100 == 0:
+                sample_prompt = self.processing_class.decode(prompt_ids[0], skip_special_tokens=False)
+                sample_output = self.processing_class.decode(prompt_completion_ids[0], skip_special_tokens=False)
+
+                html_str = f"""
+                <div style='font-family:monospace'>
+                    <b>Prompt:</b><br>
+                    <pre>{escape(sample_prompt)}</pre><br>
+                    <b>Output:</b><br>
+                    <pre>{escape(sample_output)}</pre>
+                </div>
+                """
+
+                wandb.log({"generation_html": wandb.Html(html_str)}, step=self.state.global_step)
 
         # Compute prompt length and extract completion ids
         prompt_length = prompt_ids.size(1)
@@ -366,7 +382,10 @@ if __name__ == '__main__':
     # 3. Configure training
     training_args = GRPOConfig(
         output_dir="output",
-        learning_rate=1e-5
+        learning_rate=1e-5,
+        logging_strategy="steps",
+        logging_steps=10,
+        report_to="wandb",
     )
 
     # 4. Initialize and train
@@ -385,9 +404,6 @@ if __name__ == '__main__':
     for name, param in vibration_llm_dataset.vib_tokenizer.model.named_parameters():
         if param.requires_grad:
             print(f"[VIB_EMBEDDING] Trainable: {name}")
-
-    # Merge parameters into trainer.optimizer
-    # This requires redefining the optimizer with additional params
 
     # Define optimizer using only parameters with requires_grad=True
     vib_embedder = vibration_llm_dataset.vib_tokenizer
