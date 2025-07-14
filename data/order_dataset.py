@@ -180,19 +180,12 @@ class OrderFreqDataset(Dataset):
     def open_file(self, file_path):
     
         # 0. File Open & Parsing
-        class_name, sampling_rate, rpm, severity, load_condition, _ = os.path.split(file_path)[-1].split('_')
+        class_name, sampling_rate, rpm, _, load_condition, _ = os.path.split(file_path)[-1].split('_')
+        
         sampling_rate = float(sampling_rate[:-3])*1000
         rpm = float(rpm)
         specific_class_name = class_name
         class_name = class_name.split('-')[0]
-        
-        data_info = {
-            'class_name' : class_name,
-            'specific_class_name' : specific_class_name,
-            'sampling_rate' : sampling_rate,
-            'severity' : severity,
-            'load_condition' : load_condition
-        }
         
         file_pd = pd.read_csv(file_path)
         data = []
@@ -220,8 +213,22 @@ class OrderFreqDataset(Dataset):
             interpolated_ch = freq(interpolated_freq)
             interpolated_mag.append(interpolated_ch)
         interpolated_mag = np.array(interpolated_mag)
+        
+        severity = self.calculate_severity(data_np)
+        
+        data_info = {
+            'class_name' : class_name,
+            'specific_class_name' : specific_class_name,
+            'sampling_rate' : sampling_rate,
+            'severity' : severity,
+            'load_condition' : load_condition
+        }
 
         return interpolated_mag, interpolated_freq, data_info
+    
+    def calculate_severity(self, data_np):
+        severity = '여기에서 연산'
+        return severity
     
     
     def load_dataset(self, data_root, cache_dir):
