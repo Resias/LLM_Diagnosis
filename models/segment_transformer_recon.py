@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
+from segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
 
 
 class ResidualSegmentSelfAttention(nn.Module):
@@ -90,7 +90,7 @@ class SegmentReconModel(nn.Module):
         #    세그먼트 임베딩을 평균(pool)한 뒤 FC
         self.classifier = SegmentClassifier(embed_dim, num_segments, num_classes)
 
-    def forward(self, x_sample, x_normal, classify=False):
+    def forward(self, x_sample, x_normal, classify=False, get_z=False):
         """
         Args:
             x: 원본 FFT 시퀀스, shape (B, 2, seg_len * num_segments)
@@ -118,6 +118,11 @@ class SegmentReconModel(nn.Module):
             normal_attn, scores = attn(normal_attn)
             sample_scores_list.append(scores)
             normal_scores_list.append(scores)
+        if get_z:
+            return sample_attn, normal_attn, {
+                "sample_attn_scores_list": sample_scores_list,
+                "normal_attn_scores_list": normal_scores_list
+            }
 
 
         # --- 재구성 헤드 ---
@@ -167,8 +172,15 @@ if __name__ == "__main__":
     recon_criterion = nn.MSELoss()
     cls_criterion = nn.CrossEntropyLoss()
 
-    recon = model(dummy_x, dummy_x2)
+    # reconstruction 만
+    recon, _ = model(dummy_x, dummy_x2)
+    print(f"Recon shape: {recon.shape}")  # (B, 2, seg_len * num_segments)
+    # classification 시에
     recon, logits, scores = model(dummy_x, dummy_x2, classify=True)
+    print(f"Recon shape: {recon.shape}, Logits shape: {logits.shape}")  # (B, 2, seg_len * num_segments), (B, num_classes)
+    # latent z를 가져오기위해
+    recon_attn, norm_attn, scores = model(dummy_x, dummy_x2, classify=False, get_z=True)
+    print(f"Recon Attn shape: {recon_attn.shape}, Norm Attn shape: {norm_attn.shape}")  # (B, S, D)
     loss_recon = recon_criterion(recon, dummy_x)
     loss_cls = cls_criterion(logits, dummy_y)
     # 멀티태스크 가중치: 재구성 0.5, 분류 0.5 (필요시 조정)
