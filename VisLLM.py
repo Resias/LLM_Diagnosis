@@ -383,33 +383,33 @@ if __name__ == '__main__':
     )
     
 
-    training_args = GRPOConfig(
-        output_dir="output",
-        logging_strategy="steps",
-        logging_steps=10,
-        report_to="wandb",
-    )
-    trainer = CustomGRPOTRainer(
-        model=llm,
-        processing_class=tokenizer,
-        args=training_args,
-        train_dataset=trainset,
-        eval_dataset=valset,
-        reward_funcs=[reward_format, reward_accuracy],
-    )
+    # training_args = GRPOConfig(
+    #     output_dir="output",
+    #     logging_strategy="steps",
+    #     logging_steps=10,
+    #     report_to="wandb",
+    # )
+    # trainer = CustomGRPOTRainer(
+    #     model=llm,
+    #     processing_class=tokenizer,
+    #     args=training_args,
+    #     train_dataset=trainset,
+    #     eval_dataset=valset,
+    #     reward_funcs=[reward_format, reward_accuracy],
+    # )
 
-    for name, param in trainset.vib_tokenizer.vib_encoder.named_parameters():
-        if param.requires_grad:
-            print(f"[ENCODER] Trainable: {name}")
-    for name, param in trainset.vib_tokenizer.model.named_parameters():
-        if param.requires_grad:
-            print(f"[VIB_EMBEDDING] Trainable: {name}")
+    # for name, param in trainset.vib_tokenizer.vib_encoder.named_parameters():
+    #     if param.requires_grad:
+    #         print(f"[ENCODER] Trainable: {name}")
+    # for name, param in trainset.vib_tokenizer.model.named_parameters():
+    #     if param.requires_grad:
+    #         print(f"[VIB_EMBEDDING] Trainable: {name}")
 
-    vib_embedder = trainset.vib_tokenizer
-    model = trainer.model
-    learning_rate = training_args.learning_rate
-    params = list(filter(lambda p: p.requires_grad, vib_embedder.parameters())) + \
-             list(filter(lambda p: p.requires_grad, model.parameters()))
-    trainer.optimizer = torch.optim.AdamW(params, lr=learning_rate)
+    # vib_embedder = trainset.vib_tokenizer
+    # model = trainer.model
+    # learning_rate = training_args.learning_rate
+    # params = list(filter(lambda p: p.requires_grad, vib_embedder.parameters())) + \
+    #          list(filter(lambda p: p.requires_grad, model.parameters()))
+    # trainer.optimizer = torch.optim.AdamW(params, lr=learning_rate)
 
-    trainer.train()
+    # trainer.train()

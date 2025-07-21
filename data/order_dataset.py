@@ -6,8 +6,8 @@ import numpy as np
 import lightning as L
 
 import torch
-
-from utils.util import count_classes
+from scipy.integrate import cumulative_trapezoid
+# from utils.util import count_classes
 from torch.utils.data import random_split, Dataset, DataLoader
 from scipy.interpolate import interp1d
 from scipy.stats import skew, kurtosis
@@ -123,6 +123,7 @@ class OrderFreqDataset(Dataset):
             print(f'load from caching...')
             data_np = np.load(data_cache_path)
             dataset_df = pd.read_csv(info_cache_path)
+            dataset_df['rms'] = dataset_df['rms'].apply(lambda x: np.fromstring(x.strip("[]"), sep=' '))
             
             self.dataset_df = dataset_df
             self.data_np = data_np
@@ -142,16 +143,17 @@ class OrderFreqDataset(Dataset):
         return len(self.dataset_df)
         
     def __getitem__(self, index, data_info=False):
-        sample_np, normal_np, class_name, row = self.sampling_smoothing(index)
+        sample_np, normal_np, rms_np, class_name, row = self.sampling_smoothing(index)
         
         sample_tensor = torch.tensor(sample_np, dtype=torch.float32)
         normal_tensor = torch.tensor(normal_np, dtype=torch.float32)
+        rms_tensor = torch.tensor(rms_np, dtype=torch.float32)
         class_tensor = torch.tensor(self.classes.index(class_name), dtype=torch.long)
         
         if data_info:
-            return sample_tensor, normal_tensor, row
+            return sample_tensor, normal_tensor,rms_tensor, row
         
-        return sample_tensor, normal_tensor, class_tensor
+        return sample_tensor, normal_tensor, rms_tensor, class_tensor
         
     def sampling_smoothing(self, index):
         row = self.dataset_df.iloc()[index]
@@ -159,30 +161,37 @@ class OrderFreqDataset(Dataset):
         dataset = row['dataset']
         class_name = row['class_name']
         specific_class = row['specific_class_name']
-        severity = row['severity']
+        rms = row['rms'] # 각속도로 바꾸어주세용!
         load_condition = row['load_condition']
         
         sample_mag = self.data_np[index]
 
         intra_samples = self.dataset_df[(self.dataset_df['dataset'] == dataset) & \
-                                        (self.dataset_df['class_name'] == class_name) & \
-                                        (self.dataset_df['specific_class_name'] == specific_class) & \
-                                        (self.dataset_df['load_condition'] == load_condition) & \
-                                        (self.dataset_df['severity'] == severity)    ].sample(n=self.averaging_size)
+                                        (self.dataset_df['class_name'] == class_name)    ].sample(n=self.averaging_size)
+        intra_rms_np = np.array(intra_samples['rms'].values) # data_num x 2 # 각속도로 바꾸어주세용!
         intra_mag_np = self.data_np[intra_samples.index]
 
         normal_samples = self.dataset_df[(self.dataset_df['dataset'] == dataset) & (self.dataset_df['class_name'] == 'normal')].sample(n=self.averaging_size)
+        normal_rms_np = np.array(normal_samples['rms'].values) # data_num x 2 # 각속도로 바꾸어주세용!
         normal_mag_np = self.data_np[normal_samples.index]
         
         intra_mean_mag =intra_mag_np.mean(axis=0)
+        intra_mean_rms =intra_rms_np.mean(axis=0)
+        
         normal_mean_mag = normal_mag_np.mean(axis=0)
+        normal_mean_rms =normal_rms_np.mean(axis=0)
+        
         smoothed_mag = (sample_mag + intra_mean_mag)/2
+        smoothed_rms = (rms + intra_mean_rms)/2
         
         # ratio = (smoothed_mag - normal_mean_mag)/normal_mean_mag.max()
         normalized_mag = smoothed_mag/normal_mean_mag.max()
         normalized_normal_mag = normal_mean_mag/normal_mean_mag.max()
         
-        return normalized_mag, normalized_normal_mag, class_name, row
+        normalized_rms = (smoothed_rms-normal_mean_rms)/normal_mean_rms
+        
+        
+        return normalized_mag, normalized_normal_mag, normalized_rms, class_name, row
     
     def open_file(self, file_path):
     
@@ -221,21 +230,24 @@ class OrderFreqDataset(Dataset):
             interpolated_mag.append(interpolated_ch)
         interpolated_mag = np.array(interpolated_mag)
         
-        severity = self.calculate_severity(data_np)
+        rms = self.calculate_rms(data_np, sampling_rate)
         
         data_info = {
             'class_name' : class_name,
             'specific_class_name' : specific_class_name,
             'sampling_rate' : sampling_rate,
-            'severity' : severity,
+            'rms' : rms,
             'load_condition' : load_condition
         }
 
         return interpolated_mag, interpolated_freq, data_info
     
-    def calculate_severity(self, data_np):
-        severity = '여기에서 연산'
-        return severity
+    def calculate_rms(self, data_np, sampling_rate):
+        vel = cumulative_trapezoid(data_np, dx=1/sampling_rate)
+        vel_mm = vel*1000
+        rms = np.sqrt(np.mean(vel_mm**2, axis=-1))
+        
+        return rms
     
     
     def load_dataset(self, data_root, cache_dir):
@@ -327,13 +339,24 @@ class ExtendedOrderFreqDataset(OrderFreqDataset):
 if __name__ == '__main__':
     
     dataset = OrderFreqDataset(
-        data_root= '/home/data'
+        data_root= '/workspace/dataset'
     )
 
-    sample_tensor, normal_tensor, class_tensor = dataset[0]
-    print(f'sample_tensor : {sample_tensor.shape}')
-    print(f'normal_tensor : {normal_tensor.shape}')
-    print(f'class : {class_tensor}')
+    rms_save = []
+    for idx in tqdm(range(len(dataset))):
+        sample_tensor, normal_tensor,rms_tensor, row = dataset.__getitem__(index=idx, data_info=True)
+        class_name = row['class_name']
+        dataset_name = row['dataset']
+        rms_np = rms_tensor.numpy()
+        rms_save.append([dataset_name, class_name, rms_np[0], rms_np[1]])
+    rms_df = pd.DataFrame(rms_save, columns=['dataset_name', 'class_name', 'motor_x', 'motor_y'])
+    rms_df.to_csv('testing.csv')
+    
+    
+    # sample_tensor, normal_tensor, class_tensor = dataset[0]
+    # print(f'sample_tensor : {sample_tensor.shape}')
+    # print(f'normal_tensor : {normal_tensor.shape}')
+    # print(f'class : {class_tensor}')
     # cached = CachedDataset(dataset=dataset)
     # Ldm = LightningDM(dataset=cached, batch_size=64, seed=42)
     
