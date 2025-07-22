@@ -25,3 +25,5 @@ parameters:
     values: [2, 4, 6]
   loss_alpha:
     values: [0.3, 0.5, 0.8]
+  max_epochs:
+    values: [50]
