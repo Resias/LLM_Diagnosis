@@ -62,7 +62,7 @@ class SegmentReconModel(nn.Module):
         super().__init__()
         self.num_segments = num_segments
         self.seg_len = seg_len
-
+        self.embed_dim = embed_dim
         # 1) 공유 인코더
         self.embedder = SegmentEmbedder(embed_dim)
         self.enc_layers = nn.ModuleList([
