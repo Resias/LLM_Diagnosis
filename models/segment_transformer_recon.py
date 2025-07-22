@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
+from models.segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
 
 
 class ResidualSegmentSelfAttention(nn.Module):
