@@ -55,7 +55,7 @@ class LightningReconClassifyMD(L.LightningModule):
         )
     
     def training_step(self, batch, batch_idx):
-        signal_data, normal_tensor, y = batch
+        signal_data, normal_tensor, rms, y = batch
         NanChecking = [torch.isnan(signal_data).any(), torch.isnan(normal_tensor).any(), torch.isnan(y).any()]
         if any(NanChecking):
             raise ValueError(
@@ -104,7 +104,7 @@ class LightningReconClassifyMD(L.LightningModule):
         return loss
     
     def validation_step(self, batch, batch_idx):
-        signal_data, normal_tensor, y = batch
+        signal_data, normal_tensor, rms, y = batch
         NanChecking = [torch.isnan(signal_data).any(), torch.isnan(normal_tensor).any(), torch.isnan(y).any()]
         if any(NanChecking):
             raise ValueError(
@@ -153,7 +153,7 @@ class LightningReconClassifyMD(L.LightningModule):
         return loss
     
     def test_step(self, batch, batch_idx):
-        signal_data, normal_tensor, y = batch
+        signal_data, normal_tensor, rms, y = batch
         NanChecking = [torch.isnan(signal_data).any(), torch.isnan(normal_tensor).any(), torch.isnan(y).any()]
         if any(NanChecking):
             raise ValueError(

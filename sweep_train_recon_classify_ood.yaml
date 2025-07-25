@@ -1,0 +1,27 @@
+# sweep_train_recon.yaml
+program : train_recon_w_trainer_ood.py
+name: sweep for model find recon with classify in ood setting
+description: Finding model parameteres
+project: LLM_PHM_rec_classify_odd
+method: bayes  # 또는 grid, random
+metric:
+  name: valid/F1_score
+  goal: maximize
+
+parameters:
+  ood_dataset:
+    values: ['dxai', 'mfd', 'vat', 'vbl']
+  training_mode:
+    values: ['recon_classify']
+  recon_loss:
+    values: [mae, mse, huber]
+  embed_dim:
+    values: [32, 64, 128, 256, 512]
+  n_heads:
+    values: [8, 16]
+  n_enc_layers:
+    values: [3, 4, 6]
+  n_dec_layers:
+    values: [3, 4, 6]
+  loss_alpha:
+    values: [0.3, 0.5, 0.8]

@@ -7,7 +7,7 @@ import lightning as L
 
 import torch
 from scipy.integrate import cumulative_trapezoid
-# from utils.util import count_classes
+from utils.util import count_classes
 from torch.utils.data import random_split, Dataset, DataLoader
 from scipy.interpolate import interp1d
 from scipy.stats import skew, kurtosis
@@ -15,14 +15,16 @@ import numpy as np
 from tqdm import tqdm
 
 class LightningDM(L.LightningDataModule):
-    def __init__(self, dataset, classes, batch_size=512, seed=42, splits=[0.7, 0.3], transform = None):
+    def __init__(self, args, dataset, dataset_list, classes, batch_size=512, seed=42, splits=[0.7, 0.3], transform = None):
         super().__init__()
         self.dataset = dataset
         self.batch = batch_size
         self.seed = seed
         self.splits = splits
         self.transform = transform
+        self.dataset_list = dataset_list
         self.classes = classes
+        self.args = args
     def setup(self, stage: str):
         if self.transform is not None:
             print("To Do")
@@ -38,21 +40,36 @@ class LightningDM(L.LightningDataModule):
             raise ValueError(f"Invalid length for self.splits: expected 2 or 3, got {len(self.splits)}")
         print("Start Sampling")
         if stage == "fit":
-            if len(self.splits) == 2:
-                self.data_train, self.data_val = random_split(
-                    self.dataset, [train_len, val_len]
-                )
+            if self.args.ood_dataset is None:
+                if len(self.splits) == 2:
+                    self.data_train, self.data_val = random_split(
+                        self.dataset, [train_len, val_len]
+                    )
+                else:
+                    self.data_train, self.data_val, self.data_t = random_split(
+                        self.dataset, [train_len, val_len, test_len]
+                    )
             else:
-                self.data_train, self.data_val, self.data_t = random_split(
-                    self.dataset, [train_len, val_len, test_len]
-                )
+                self.data_train = self.dataset
+                self.data_val = OrderFreqDataset(
+                    data_root= self.args.dataset_root,
+                    classes = self.args.classes, 
+                    dataset_list= self.dataset_list,
+                    averaging_size = self.args.average_size, 
+                    target_len = self.args.target_length, 
+                    sensor_list = self.args.sensor_list,
+                    max_order = self.args.max_order)
         if stage == "test":
-            if len(self.splits) == 2:
-                self.data_test = self.dataset
-            else:
-                self.data_test = self.data_t
+            self.data_test = OrderFreqDataset(
+                data_root= self.args.dataset_root,
+                classes = self.args.classes, 
+                dataset_list= self.dataset_list,
+                averaging_size = self.args.average_size, 
+                target_len = self.args.target_length, 
+                sensor_list = self.args.sensor_list,
+                max_order = self.args.max_order)
         if stage == "predict":
-            self.data_predict = self.dataset
+            self.data_predict = self.data_test
         class_counts = count_classes(self.dataset)
         num_classes = len(self.classes)
         counts = np.zeros(num_classes, dtype=np.float32)
@@ -65,7 +82,7 @@ class LightningDM(L.LightningDataModule):
     def train_dataloader(self):
         return DataLoader(self.data_train, batch_size=self.batch, shuffle=True)
     def val_dataloader(self):
-        return DataLoader(self.data_val, batch_size=self.batch, shuffle=True)
+        return DataLoader(self.data_val, batch_size=self.batch)
     def test_dataloader(self):
         return DataLoader(self.data_test, batch_size=self.batch)
     def predict_dataloader(self):
@@ -151,7 +168,7 @@ class OrderFreqDataset(Dataset):
         class_tensor = torch.tensor(self.classes.index(class_name), dtype=torch.long)
         
         if data_info:
-            return sample_tensor, normal_tensor,rms_tensor, row
+            return sample_tensor, normal_tensor, rms_tensor, row
         
         return sample_tensor, normal_tensor, rms_tensor, class_tensor
         
@@ -246,7 +263,6 @@ class OrderFreqDataset(Dataset):
         vel = cumulative_trapezoid(data_np, dx=1/sampling_rate)
         vel_mm = vel*1000
         rms = np.sqrt(np.mean(vel_mm**2, axis=-1))
-        
         return rms
     
     

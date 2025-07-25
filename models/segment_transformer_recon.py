@@ -118,10 +118,15 @@ class SegmentReconModel(nn.Module):
             normal_attn, scores = attn(normal_attn)
             sample_scores_list.append(scores)
             normal_scores_list.append(scores)
+        
+        cross_attn_out, cross_score = self.cross_attn(sample_attn, normal_attn)
+        normal_cross_attn_out, normal_cross_score = self.cross_attn(normal_attn, normal_attn)
         if get_z:
-            return sample_attn, normal_attn, {
+            return sample_attn, normal_attn, cross_attn_out, normal_cross_attn_out, {
                 "sample_attn_scores_list": sample_scores_list,
-                "normal_attn_scores_list": normal_scores_list
+                "normal_attn_scores_list": normal_scores_list,
+                "cross_attn_score": cross_score,
+                "normal_cross_scores": normal_cross_score
             }
 
 
@@ -134,13 +139,12 @@ class SegmentReconModel(nn.Module):
         recon = x
 
         if classify:
-            # --- 분류 헤드 ---
-            cross_attn_out, cross_scores = self.cross_attn(sample_attn, normal_attn)  # (B, 10, D), (B, 10, 10)
+            # --- 분류 헤드 ---  # (B, 10, D), (B, 10, 10)
             logits = self.classifier(cross_attn_out)   # (B, num_classes)
             return recon, logits, {
                 "sample_attn_scores_list": sample_scores_list,
                 "normal_attn_scores_list": normal_scores_list,
-                "cross_attn_scores": cross_scores
+                "cross_attn_scores": cross_score
             }
         return recon, {
                 "sample_attn_scores_list": sample_scores_list,
