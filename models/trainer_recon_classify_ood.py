@@ -21,7 +21,8 @@ class LightningReconClassifyMD(L.LightningModule):
                  class_loss='ce',
                  loss_alpha=0.5,
                  focal_alpha=None,
-                 classes=None):
+                 classes=None,
+                 postional_enc = False):
         super(LightningReconClassifyMD, self).__init__()
         self.model = model
         self.recon_loss = ReconLoss(loss_name=recon_loss)
@@ -34,6 +35,7 @@ class LightningReconClassifyMD(L.LightningModule):
         self.automatic_optimization = True
         self.training_mode = training_mode  # 'recon_classify' or 'recon_only'
         self.alpha = loss_alpha
+        self.position_enc = postional_enc
         self.save_hyperparameters()
 
     def label_to_index(self, labels):
@@ -78,7 +80,7 @@ class LightningReconClassifyMD(L.LightningModule):
             self.log(f"train/recon_loss", loss, sync_dist=True)
             self.log_attention_heatmaps_random(attn, pred, y, "train", logger_step, num_samples=2)
         elif self.training_mode == 'recon_classify':
-            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True)
+            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True, positional_encode = self.position_enc)
             NanChecking = [torch.isnan(recon).any(), torch.isnan(pred).any()]
             if any(NanChecking):
                 raise ValueError(
@@ -127,7 +129,7 @@ class LightningReconClassifyMD(L.LightningModule):
             self.log(f"valid/recon_loss", loss, sync_dist=True)
             self.log_attention_heatmaps_random(attn, pred, y, "valid", logger_step, num_samples=1)
         elif self.training_mode == 'recon_classify':
-            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True)
+            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True, positional_encode = self.position_enc)
             NanChecking = [torch.isnan(recon).any(), torch.isnan(pred).any()]
             if any(NanChecking):
                 raise ValueError(
@@ -177,7 +179,7 @@ class LightningReconClassifyMD(L.LightningModule):
             self.log_attention_heatmaps_random(attn, pred, y, "test", logger_step, num_samples=2)
             return loss
         elif self.training_mode == 'recon_classify':
-            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True)
+            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True, positional_encode = self.position_enc)
             NanChecking = [torch.isnan(recon).any(), torch.isnan(pred).any()]
             if any(NanChecking):
                 raise ValueError(

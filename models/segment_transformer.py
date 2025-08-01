@@ -1,9 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+
+def get_sinusoid_encoding_table(seq_len, embed_dim):
+    '''Sinusoidal positional encoding (shape: [seq_len, embed_dim])'''
+    position = torch.arange(seq_len, dtype=torch.float).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, embed_dim, 2).float() * (-math.log(10000.0) / embed_dim))
+    pe = torch.zeros(seq_len, embed_dim)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+    return pe # (seq_len, embed_dim)
 
 class SegmentEmbedder(nn.Module):
-    def __init__(self, embed_dim):
+    def __init__(self, embed_dim, seq_len=10):
         super().__init__()
         self.embed = nn.Sequential(
             nn.Conv2d(in_channels=1, out_channels=8, kernel_size=(2, 3), padding=(0, 1)),
@@ -11,13 +21,17 @@ class SegmentEmbedder(nn.Module):
             nn.Flatten(),
             nn.Linear(8 * 26, embed_dim)
         )
+        pe = get_sinusoid_encoding_table(seq_len, embed_dim)
+        self.register_buffer('pos_encoding', pe)  # shape: (seq_len, embed_dim)
 
-    def forward(self, x):
+    def forward(self, x, positional_encode = False):
         # x: (batch, 10, 2, 26)
         B, S, C, L = x.shape
         x = x.reshape(B * S, 1, C, L)  # 명시적 reshape
         out = self.embed(x)           # → (B*S, embed_dim)
         out = out.reshape(B, S, -1)   # → (B, 10, embed_dim)
+        if positional_encode:
+            out = out + self.pos_encoding.unsqueeze(0)  # (B, 10, embed_dim)
         return out
 
 class SegmentSelfAttention(nn.Module):
@@ -62,13 +76,13 @@ class SegmentLevelModel(nn.Module):
         self.cross_attn = SegmentCrossAttention(embed_dim, n_heads)
         self.classifier = SegmentClassifier(embed_dim, num_segments, num_classes)
 
-    def forward(self, x_sample, x_normal):
+    def forward(self, x_sample, x_normal, positional_encode = False):
         seg_sample = x_sample.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
         seg_normal = x_normal.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
 
         # x_sample, x_normal: (batch, 10, 2, 26)
-        sample_embed = self.embedder(seg_sample)             # (B, 10, D)
-        normal_embed = self.embedder(seg_normal)             # (B, 10, D)
+        sample_embed = self.embedder(seg_sample, positional_encode)             # (B, 10, D)
+        normal_embed = self.embedder(seg_normal, positional_encode)             # (B, 10, D)
 
         sample_attn, sample_scores = self.self_attn(sample_embed)   # (B, 10, D), (B, 10, 10)
         normal_attn, normal_scores = self.self_attn(normal_embed)   # (B, 10, D), (B, 10, 10)

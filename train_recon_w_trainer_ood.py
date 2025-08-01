@@ -43,18 +43,19 @@ def get_args():
     parser.add_argument('--data_splits_ratio', type=list, help='train, validation or plus test dataset ratio', default=[0.7, 0.3])
     parser.add_argument('--training_mode', type=str, help='for training mode', default='recon_only') # 'recon_classify' or 'recon_only'
     parser.add_argument('--class_loss', type=str, help='for classification loss', default='focal')
-    parser.add_argument('--recon_loss', type=str, help='for reconstruction loss', default='mse')
+    parser.add_argument('--recon_loss', type=str, help='for reconstruction loss', default='huber')
     parser.add_argument('--loss_alpha', type=float, help='for classification loss alpha', default=0.5)
     # Model Settings
     parser.add_argument('--embed_dim', type=int, help='model embed dimension', default=64)
-    parser.add_argument('--n_heads', type=int, help='model num of heads', default=4)
-    parser.add_argument('--n_enc_layers', type=int, help='model num of encoder layer', default=3)
-    parser.add_argument('--n_dec_layers', type=int, help='model num of decoder layer', default=3)
+    parser.add_argument('--n_heads', type=int, help='model num of heads', default=16)
+    parser.add_argument('--n_enc_layers', type=int, help='model num of encoder layer', default=6)
+    parser.add_argument('--n_dec_layers', type=int, help='model num of decoder layer', default=6)
     parser.add_argument('--n_segments', type=int, help='model num of segments', default=10)
     parser.add_argument('--num_classes', type=int, help='model num of classes', default=4)
+    parser.add_argument('--positional_encode', type=bool, help='Setting about postional Encoding', default=False)
     # Training Settings
     parser.add_argument('--fast_dev_run', type=bool, help='pytorch lightning fast_dev_run', default=False)
-    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=80)
+    parser.add_argument('--max_epochs', type=int, help='Maximum epochs', default=200)
     return parser.parse_args()
 
 
@@ -107,7 +108,8 @@ def get_model(args, focal_alpha=None):
         class_loss = args.class_loss,
         loss_alpha = args.loss_alpha,
         focal_alpha = focal_alpha,
-        classes = args.classes
+        classes = args.classes,
+        postional_enc= args.positional_encode
     )
     return Lmd
 

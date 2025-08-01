@@ -90,7 +90,7 @@ class SegmentReconModel(nn.Module):
         #    세그먼트 임베딩을 평균(pool)한 뒤 FC
         self.classifier = SegmentClassifier(embed_dim, num_segments, num_classes)
 
-    def forward(self, x_sample, x_normal, classify=False, get_z=False):
+    def forward(self, x_sample, x_normal, classify=False, get_z=False, positional_encode=False):
         """
         Args:
             x: 원본 FFT 시퀀스, shape (B, 2, seg_len * num_segments)
@@ -105,8 +105,8 @@ class SegmentReconModel(nn.Module):
         segs = x_sample.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
         norm_seg = x_normal.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
         # 2) 임베딩 → (B, S, D)
-        sample_embed = self.embedder(segs)
-        normal_embed = self.embedder(norm_seg)
+        sample_embed = self.embedder(segs, positional_encode)
+        normal_embed = self.embedder(norm_seg, positional_encode)
 
         # 3) Self-Attention 인코딩
         sample_attn = sample_embed
