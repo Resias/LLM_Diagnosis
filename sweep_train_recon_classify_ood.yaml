@@ -20,6 +20,6 @@ parameters:
   n_heads:
     values: [16, 32]
   cont_loss_alpha:
-    distribution: log_uniform
-    min: 1e-1
-    max: 5e-1
+    distribution: log_uniform_values
+    min: 0.1
+    max: 0.5
