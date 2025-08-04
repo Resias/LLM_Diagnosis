@@ -2,7 +2,7 @@
 program : train_recon_w_trainer_ood.py
 name: sweep for model find recon with classify in ood setting
 description: Finding model parameteres
-project: LLM_PHM_rec_cls_odd3_w_pos_enc
+project: LLM_PHM_rec_cls_odd_w_pos_enc_cont
 method: bayes  # 또는 grid, random
 metric:
   name: valid/F1_score
@@ -17,3 +17,9 @@ parameters:
     values: [32, 64, 128, 256, 512]
   positional_encode:
     values: [True]
+  n_heads:
+    values: [16, 32]
+  cont_loss_alpha:
+    distribution: log_uniform
+    min: 1e-1
+    max: 5e-1

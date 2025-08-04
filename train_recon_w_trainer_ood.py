@@ -44,7 +44,11 @@ def get_args():
     parser.add_argument('--training_mode', type=str, help='for training mode', default='recon_only') # 'recon_classify' or 'recon_only'
     parser.add_argument('--class_loss', type=str, help='for classification loss', default='focal')
     parser.add_argument('--recon_loss', type=str, help='for reconstruction loss', default='huber')
+    parser.add_argument('--cont_loss', type=str, help='for contrastive loss', default='sup')
     parser.add_argument('--loss_alpha', type=float, help='for classification loss alpha', default=0.5)
+    parser.add_argument('--cont_threshold', type=float, help='for contrastive starting threshold', default=0.75)
+    parser.add_argument('--cont_loss_alpha', type=float, help='for contrastive loss alpha', default=0.1)
+    parser.add_argument('--cont_temp', type=float, help='for contrastive temperature', default=0.1)
     # Model Settings
     parser.add_argument('--embed_dim', type=int, help='model embed dimension', default=64)
     parser.add_argument('--n_heads', type=int, help='model num of heads', default=16)
@@ -106,7 +110,11 @@ def get_model(args, focal_alpha=None):
         training_mode = args.training_mode,
         recon_loss = args.recon_loss,
         class_loss = args.class_loss,
+        cont_loss = args.cont_loss,
         loss_alpha = args.loss_alpha,
+        cont_threshold = args.cont_threshold,
+        cont_alpha = args.cont_loss_alpha,
+        cont_temperature = args.cont_temp,
         focal_alpha = focal_alpha,
         classes = args.classes,
         postional_enc= args.positional_encode
