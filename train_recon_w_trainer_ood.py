@@ -26,9 +26,9 @@ def get_args():
 
     # Datset Settings
     parser.add_argument('--use_cache', type=int, help='use cached dataset', choices=[0, 1], default=1)
-    parser.add_argument('--dataset_root', type=str, help='for raw data csv root', default='/workspace/vms_dataset')
+    parser.add_argument('--dataset_root', type=str, help='for raw data csv root', default='/home/data')
     parser.add_argument('--classes', type=list, help='classes for training', default=['normal', 'looseness', 'misalignment', 'unbalance', 'bearing'])
-    parser.add_argument('--ood_dataset', type=str, choices=TOTAL_DATASET, default=None)
+    parser.add_argument('--ood_dataset', type=str, choices=TOTAL_DATASET, default='vat')
     parser.add_argument('--dataset_list', type=list, help='datasets for training', default=['dxai', 'mfd', 'vat', 'vbl'])
     parser.add_argument('--average_size', type=int, help='average smoothing size', default=100)
     parser.add_argument('--target_length', type=int, help='data shape for final length', default=260)

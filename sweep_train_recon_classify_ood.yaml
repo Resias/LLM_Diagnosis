@@ -9,12 +9,10 @@ metric:
   goal: maximize
 
 parameters:
-  ood_dataset:
-    values: ['vat', 'vbl']
   training_mode:
     values: ['recon_classify']
   embed_dim:
-    values: [32, 64, 128, 256, 512]
+    values: [64, 128, 256, 512]
   positional_encode:
     values: [True]
   n_heads:
