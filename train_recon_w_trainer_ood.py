@@ -41,7 +41,7 @@ def get_args():
     parser.add_argument('--batch_size', type=int, help='batch size', default=128)
     parser.add_argument('--seed', type=int, help='seed', default=42)
     parser.add_argument('--data_splits_ratio', type=list, help='train, validation or plus test dataset ratio', default=[0.7, 0.3])
-    parser.add_argument('--training_mode', type=str, help='for training mode', default='recon_only') # 'recon_classify' or 'recon_only'
+    parser.add_argument('--training_mode', type=str, help='for training mode', default='recon_classify') # 'recon_classify' or 'recon_only'
     parser.add_argument('--class_loss', type=str, help='for classification loss', default='focal')
     parser.add_argument('--recon_loss', type=str, help='for reconstruction loss', default='huber')
     parser.add_argument('--cont_loss', type=str, help='for contrastive loss', default='sup')
