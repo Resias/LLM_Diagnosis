@@ -7,7 +7,7 @@ import torch
 from data.dataset import OrderInvariantSignalImager, WindowedVibrationDataset, visualize_imaging_tensor
 
 if __name__ == '__main__':
-    data_root = os.path.join(os.getcwd(), 'vms_data', 'processed')
+    data_root = os.path.join(os.getcwd(), 'data', 'processed')
     meta_csv = os.path.join(data_root, 'meta.csv')
     meta_pd = pd.read_csv(meta_csv)
     data_mode = 'stft+cross'
@@ -27,11 +27,11 @@ if __name__ == '__main__':
         eps=1e-8,
         out_dtype=torch.float32,
         max_order=20.0,           # order 축 상한
-        H_out=256,                # order-bin 수
-        W_out=256,                # time-bin 수
+        H_out=128,                # order-bin 수
+        W_out=128,                # time-bin 수
         # STFT
-        stft_nperseg=1024,
-        stft_hop=256,
+        stft_nperseg=256,
+        stft_hop=128,
         stft_window="hann",
         stft_center=True,
         stft_power=1.0,           # 1: magnitude, 2: power
@@ -54,3 +54,5 @@ if __name__ == '__main__':
     x_tensor, y_tensor = dataset[100]  # (C,H,W)
     print(y_tensor)
     visualize_imaging_tensor(x_tensor, mode=data_mode, max_order=20, window_sec=5.0, save_path='test')
+    print(x_tensor.shape)
+    print(meta_pd['class_name'])

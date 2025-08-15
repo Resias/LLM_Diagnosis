@@ -1,0 +1,30 @@
+program: vit_train.py
+method: bayes
+metric:
+  name: val_acc
+  goal: maximize
+parameters:
+  learning_rate:
+    min: 0.00001
+    max: 0.001
+    distribution: log_uniform
+  batch_size:
+    values: [8]
+  epochs:
+    value: 100
+  window_sec:
+    values: [5.0]
+  stride_sec:
+    values: [2.0]
+  max_order:
+    values: [20.0]
+  stft_mode:
+    values: ['stft+cross']
+  stft_nperseg:
+    values: [256, 512]
+  stft_hop:
+    values: [256]
+  stft_power:
+    values: [1.0]
+  image_size:
+    values: [128]

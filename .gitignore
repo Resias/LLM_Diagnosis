@@ -1,4 +1,5 @@
 data/__pycache__/
+data/processed/
 models/__pycache__/
 utils/__pycache__/
 cache_models/

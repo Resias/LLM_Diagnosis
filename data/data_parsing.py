@@ -350,7 +350,7 @@ def mfd_parsing(mfd_root, dist_root):
     return meta_pd
 
 if __name__=='__main__':
-    origianl_root = os.path.join(os.getcwd(), 'original')
+    original_root = os.path.join("/home", "data", 'original')
     output_root = os.path.join(os.getcwd(), 'unzipped')
     if os.path.exists(output_root):
         shutil.rmtree(output_root)
@@ -364,10 +364,10 @@ if __name__=='__main__':
         os.makedirs(output_root, exist_ok=True)
     if not os.path.exists(dist_root):
         os.makedirs(dist_root, exist_ok=True)
-    for file in os.listdir(origianl_root):
+    for file in os.listdir(original_root):
         if file.endswith('.zip'):
             dist_path = os.path.join(output_root, file.replace('.zip', ''))
-            with zipfile.ZipFile(os.path.join(origianl_root, file), 'r') as zip_ref:
+            with zipfile.ZipFile(os.path.join(original_root, file), 'r') as zip_ref:
                 zip_ref.extractall(path=dist_path)
     print('Unzipping completed.')
     
