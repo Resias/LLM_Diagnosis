@@ -5,26 +5,26 @@ metric:
   goal: maximize
 parameters:
   learning_rate:
-    min: 0.00001
+    min: 0.0001
     max: 0.001
-    distribution: log_uniform
-  batch_size:
-    values: [8]
+    distribution: log_uniform_values
   epochs:
-    value: 100
-  window_sec:
-    values: [5.0]
-  stride_sec:
-    values: [2.0]
-  max_order:
-    values: [20.0]
-  stft_mode:
-    values: ['stft+cross']
-  stft_nperseg:
-    values: [256, 512]
-  stft_hop:
-    values: [256]
+    value: 50
+  parameters_grid:
+    values:
+      - stft_nperseg: 256
+        stft_hop: 128
+      - stft_nperseg: 512
+        stft_hop: 128
+      - stft_nperseg: 512
+        stft_hop: 256
+      - stft_nperseg: 1024
+        stft_hop: 256
+      - stft_nperseg: 1024
+        stft_hop: 512
+      - stft_nperseg: 2048
+        stft_hop: 512
+      - stft_nperseg: 2048
+        stft_hop: 1024
   stft_power:
-    values: [1.0]
-  image_size:
-    values: [128]
+    values: [1.0, 2.0]

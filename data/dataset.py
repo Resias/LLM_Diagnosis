@@ -553,6 +553,6 @@ if __name__ == '__main__':
     )
     
     # 단일 샘플 미리보기
-    t0, y, info = dataset[100]  # (C,H,W)
-    print(info)
+    t0, y = dataset[100]  # (C,H,W)
+    # print(info)
     visualize_imaging_tensor(t0, mode="cwt+cross", max_order=20, window_sec=5.0, save_path='test')

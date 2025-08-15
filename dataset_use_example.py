@@ -27,10 +27,10 @@ if __name__ == '__main__':
         eps=1e-8,
         out_dtype=torch.float32,
         max_order=20.0,           # order 축 상한
-        H_out=128,                # order-bin 수
-        W_out=128,                # time-bin 수
+        H_out=256,                # order-bin 수
+        W_out=256,                # time-bin 수
         # STFT
-        stft_nperseg=256,
+        stft_nperseg=1024,
         stft_hop=128,
         stft_window="hann",
         stft_center=True,
@@ -46,13 +46,13 @@ if __name__ == '__main__':
         data_root=data_root,
         window_sec=5,
         stride_sec=2,
-        cache_mode='file',
+        cache_mode='none',
         transform=signal_imger
     )
 
     # 단일 샘플 미리보기
     x_tensor, y_tensor = dataset[100]  # (C,H,W)
-    print(y_tensor)
+    print(y_tensor.dtype)
     visualize_imaging_tensor(x_tensor, mode=data_mode, max_order=20, window_sec=5.0, save_path='test')
     print(x_tensor.shape)
     print(meta_pd['class_name'])

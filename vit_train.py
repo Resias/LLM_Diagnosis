@@ -44,10 +44,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         for inputs, labels in train_iter:
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            
+            # print(labels)
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, labels)
+            # print(loss)
             loss.backward()
             optimizer.step()
             
@@ -203,7 +204,7 @@ def train_with_config(rank, world_size, args):
         data_root=data_root,
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
-        cache_mode='file',
+        cache_mode='none',
         transform=signal_imger
     )
     
@@ -250,15 +251,15 @@ def train_with_config(rank, world_size, args):
         patch_size=16
     ).to(device)
     
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[rank], broadcast_buffers=False)
     
     # 손실 함수와 옵티마이저 설정
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
     
     # wandb에 모델 구조 기록 (메인 프로세스만)
-    if rank == 0:
-        wandb.watch(model, criterion, log="all", log_freq=1000)
+    # if rank == 0:
+    #     wandb.watch(model, criterion, log="all", log_freq=1000)
     
     # 학습 실행
     train_model(
@@ -323,9 +324,9 @@ def parse_args():
     parser.add_argument('--sweep_config', type=str, default=None,
                         help='Path to wandb sweep configuration file')
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--image_size', type=int, default=128)
+    parser.add_argument('--image_size', type=int, default=256)
     parser.add_argument('--num_classes', type=int, default=5)
     parser.add_argument('--window_sec', type=float, default=5.0)
     parser.add_argument('--stride_sec', type=float, default=2.0)
