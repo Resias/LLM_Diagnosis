@@ -11,3 +11,4 @@ results/
 *.ipynb
 checkpoints/*.pth
 wandb/
+checkpoints/*.pth
