@@ -9,4 +9,5 @@ cached_dataset.pt
 .DS_Store
 results/
 *.ipynb
-wandb/checkpoints/*.pth
+checkpoints/*.pth
+wandb/
