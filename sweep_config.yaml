@@ -10,21 +10,9 @@ parameters:
     distribution: log_uniform_values
   epochs:
     value: 50
-  parameters_grid:
-    values:
-      - stft_nperseg: 256
-        stft_hop: 128
-      - stft_nperseg: 512
-        stft_hop: 128
-      - stft_nperseg: 512
-        stft_hop: 256
-      - stft_nperseg: 1024
-        stft_hop: 256
-      - stft_nperseg: 1024
-        stft_hop: 512
-      - stft_nperseg: 2048
-        stft_hop: 512
-      - stft_nperseg: 2048
-        stft_hop: 1024
+  stft_nperseg:
+    values: [256, 512, 1024, 2048]   # 범주형(이산)
+  stft_hop:
+    values: [128, 256, 512, 1024]    # 범주형(이산)
   stft_power:
     values: [1.0, 2.0]

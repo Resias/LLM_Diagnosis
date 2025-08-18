@@ -174,8 +174,17 @@ def train_with_config(rank, world_size, args):
     meta_pd['sensor_position'] = meta_pd['sensor_position'].apply(ast.literal_eval)
     meta_pd = meta_pd[5 <= meta_pd['data_sec']]
     
-    using_dataset = ['dxai', 'vat', 'vbl', 'mfd']
-    meta_pd = meta_pd[meta_pd['dataset'].isin(using_dataset)]
+    # 학습용 데이터셋과 IIS 검증용 데이터셋 분리
+    train_meta = meta_pd[meta_pd['dataset'] != 'iis'].copy()
+    val_meta = meta_pd[meta_pd['dataset'] == 'iis'].copy()
+    
+    if rank == 0:  # 메인 프로세스에서만 출력
+        print(f"\nTraining samples (non-IIS): {len(train_meta)}")
+        print(f"Validation samples (IIS): {len(val_meta)}")
+        print("\nTraining dataset distribution:")
+        print(train_meta['dataset'].value_counts())
+        print("\nValidation dataset distribution:")
+        print(val_meta['dataset'].value_counts())
     
     # 이미지 변환기 설정
     signal_imger = OrderInvariantSignalImager(
@@ -198,9 +207,9 @@ def train_with_config(rank, world_size, args):
         cwt_scale_base=2.0,
     )
     
-    # 데이터셋 생성
-    dataset = WindowedVibrationDataset(
-        meta_df=meta_pd,
+    # 학습용 데이터셋 생성 (non-IIS)
+    train_dataset = WindowedVibrationDataset(
+        meta_df=train_meta,
         data_root=data_root,
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
@@ -208,11 +217,15 @@ def train_with_config(rank, world_size, args):
         transform=signal_imger
     )
     
-    # 데이터셋 분할 (8:2)
-    generator = torch.Generator().manual_seed(42)  # 재현성을 위한 시드 설정
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+    # 검증용 데이터셋 생성 (IIS)
+    val_dataset = WindowedVibrationDataset(
+        meta_df=val_meta,
+        data_root=data_root,
+        window_sec=config.window_sec,
+        stride_sec=config.stride_sec,
+        cache_mode='none',
+        transform=signal_imger
+    )
     
     # 분산 학습을 위한 sampler 생성
     train_sampler = DistributedSampler(
@@ -339,7 +352,7 @@ def parse_args():
                         help='Number of points between successive STFT segments')
     parser.add_argument('--stft_power', type=float, default=1.0,
                         help='Power of magnitude (1.0 for magnitude, 2.0 for power spectrum)')
-    parser.add_argument('--project_name', type=str, default='vibration-diagnosis')
+    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-ood')
     
     return parser.parse_args()
 
