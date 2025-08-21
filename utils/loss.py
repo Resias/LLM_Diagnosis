@@ -82,3 +82,52 @@ class ClassLoss(nn.Module):
             assert f'Wrong Loss for Classification : {loss_name}'
     def forward(self, y_hat, y):
         return self.loss(y_hat, y)
+    
+class SupConLoss(nn.Module):
+    def __init__(self, temperature=0.1, eps=1e-8):
+        super().__init__()
+        self.temperature = temperature
+        self.eps = eps
+
+    def forward(self, features, labels):
+        """
+        features: (B, D) normalized embeddings
+        labels: (B,) long
+        """
+        device = features.device
+        labels = labels.contiguous().view(-1, 1)  # (B,1)
+        mask = torch.eq(labels, labels.T).float().to(device)  # (B,B), positive mask
+
+        # cosine similarity matrix
+        sim = torch.matmul(features, features.T)  # (B,B), since normalized it's cosine
+        sim = sim / self.temperature
+
+        # for numerical stability
+        logits_max, _ = torch.max(sim, dim=1, keepdim=True)
+        logits = sim - logits_max.detach()
+
+        exp_logits = torch.exp(logits)  # (B,B)
+        # remove self-comparison
+        logits_mask = torch.ones_like(mask) - torch.eye(features.size(0), device=device)
+        mask = mask * logits_mask
+
+        # denominator: sum over all except self
+        denom = (exp_logits * logits_mask).sum(1, keepdim=True)  # (B,1)
+
+        # numerator: sum over positives
+        numerator = (exp_logits * mask).sum(1, keepdim=True)  # (B,1)
+        # avoid zero
+        frac = numerator / (denom + self.eps)
+        loss = -torch.log(frac + self.eps)
+        loss = loss.mean()
+        return loss
+
+class ContLoss(nn.Module):
+    def __init__(self, loss_name='sup', temperature=0.1, eps=1e-8):
+        super().__init__()
+        if loss_name == 'sup':
+            self.loss = SupConLoss(temperature=temperature)
+        else:
+            assert f'Wrong Loss for Reconstruction : {loss_name}'
+    def forward(self, y_hat, y):
+        return self.loss(y_hat, y)

@@ -6,12 +6,13 @@ import gc
 import lightning as L
 
 import torch
+import torch.nn.functional as F
 
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-from utils.loss import ClassLoss, ReconLoss
+from utils.loss import ClassLoss, ReconLoss, ContLoss
 
 class LightningReconClassifyMD(L.LightningModule):
     def __init__(self, 
@@ -19,13 +20,22 @@ class LightningReconClassifyMD(L.LightningModule):
                  training_mode='recon_classify',
                  recon_loss='mse',
                  class_loss='ce',
+                 cont_loss='sup',
+                 cont_threshold=0.75,
+                 cont_alpha=0.1,
+                 cont_temperature=0.1,
                  loss_alpha=0.5,
                  focal_alpha=None,
-                 classes=None):
+                 classes=None,
+                 postional_enc = False):
         super(LightningReconClassifyMD, self).__init__()
         self.model = model
         self.recon_loss = ReconLoss(loss_name=recon_loss)
         self.class_loss = ClassLoss(loss_name=class_loss, alpha=focal_alpha)
+        self.cont_loss = ContLoss(loss_name=cont_loss, temperature=cont_temperature)
+        self.contrastive_threshold = cont_threshold  # 예: batch accuracy 기준
+        self.contrastive_weight = cont_alpha
+        self.use_contrastive = False  # 동적으로 켜기 위해 내부 플래그
         self.classes = classes
         self.y_train_true, self.y_train_pred = [], []
         self.y_valid_true, self.y_valid_pred = [], []
@@ -34,6 +44,7 @@ class LightningReconClassifyMD(L.LightningModule):
         self.automatic_optimization = True
         self.training_mode = training_mode  # 'recon_classify' or 'recon_only'
         self.alpha = loss_alpha
+        self.position_enc = postional_enc
         self.save_hyperparameters()
 
     def label_to_index(self, labels):
@@ -78,7 +89,7 @@ class LightningReconClassifyMD(L.LightningModule):
             self.log(f"train/recon_loss", loss, sync_dist=True)
             self.log_attention_heatmaps_random(attn, pred, y, "train", logger_step, num_samples=2)
         elif self.training_mode == 'recon_classify':
-            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True)
+            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True, positional_encode = self.position_enc)
             NanChecking = [torch.isnan(recon).any(), torch.isnan(pred).any()]
             if any(NanChecking):
                 raise ValueError(
@@ -88,15 +99,43 @@ class LightningReconClassifyMD(L.LightningModule):
             
             rec_loss = self.recon_loss(recon, signal_data)
             cl_loss = self.class_loss(pred, y)
+            
+            # batch-level accuracy proxy (정확도)
+            pred_labels = torch.argmax(pred, dim=1)
+            batch_acc = (pred_labels == y).float().mean()
+
+            # contrastive 조건: batch accuracy가 threshold 이상이면 활성화
+            contrastive_loss = torch.tensor(0.0, device=self.device)
+            if batch_acc.item() >= self.contrastive_threshold:
+                # latent embedding: cross_attn_out을 얻어야 함
+                # 모델이 cross_attn_out을 logits과 함께 반환하지 않으면 get_z 방식으로 따로 호출하거나,
+                # forward를 약간 확장해 cross_attn_out을 포함하게 함.
+                # 여기선 cross_attn_out을 attn dict에 넣었다고 가정
+                # 예: attn["cross_attn_score"]가 아닌 실제 embedding이 필요하므로 모델 수정 필요
+                # 대안: cross_attn_out을 logits 앞단에서 가져오도록 모델 forward를 (recon, logits, {"cross_attn_out": ...})로 변경
+                cross_embedding = attn.get("cross_attn_out", None)  # (B, S, D)
+                if cross_embedding is not None:
+                    # pool + normalize
+                    emb = cross_embedding.mean(dim=1)  # (B, D)
+                    emb = F.normalize(emb, dim=1)  # L2 정규화
+                    contrastive_loss = self.cont_loss(emb, y)
+                else:
+                    # fallback: sample_attn if available
+                    sample_emb = attn.get("sample_attn_scores_list", None)  # 이건 score list이므로 제대로 수정 필요
+                    # 권장: 모델 forward를 cross_attn_out 포함하도록 조정
 
             self.y_train_true.extend(y.cpu().numpy())
             self.y_train_pred.extend(torch.argmax(pred, dim=1).cpu().numpy())
             self.log(f"train/recon_loss", rec_loss, sync_dist=True)
             self.log(f"train/class_loss", cl_loss, sync_dist=True)
+            if contrastive_loss != 0:
+                self.log(f"train/contrastive_loss", contrastive_loss, sync_dist=True)
 
             self.log_attention_heatmaps_random(attn, pred, y, "train", logger_step, num_samples=2)
 
             loss = self.alpha * rec_loss + (1 - self.alpha) * cl_loss
+            if batch_acc.item() >= self.contrastive_threshold:
+                loss = loss + self.contrastive_weight * contrastive_loss
             self.log(f"train/total_loss", loss, sync_dist=True)
         
         # 로그: 원본 vs 재구성
@@ -127,7 +166,7 @@ class LightningReconClassifyMD(L.LightningModule):
             self.log(f"valid/recon_loss", loss, sync_dist=True)
             self.log_attention_heatmaps_random(attn, pred, y, "valid", logger_step, num_samples=1)
         elif self.training_mode == 'recon_classify':
-            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True)
+            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True, positional_encode = self.position_enc)
             NanChecking = [torch.isnan(recon).any(), torch.isnan(pred).any()]
             if any(NanChecking):
                 raise ValueError(
@@ -177,7 +216,7 @@ class LightningReconClassifyMD(L.LightningModule):
             self.log_attention_heatmaps_random(attn, pred, y, "test", logger_step, num_samples=2)
             return loss
         elif self.training_mode == 'recon_classify':
-            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True)
+            recon, pred, attn = self.model(signal_data, normal_tensor, classify=True, positional_encode = self.position_enc)
             NanChecking = [torch.isnan(recon).any(), torch.isnan(pred).any()]
             if any(NanChecking):
                 raise ValueError(

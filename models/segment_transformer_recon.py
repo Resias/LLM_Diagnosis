@@ -4,6 +4,39 @@ import torch.nn.functional as F
 from models.segment_transformer import SegmentEmbedder, SegmentSelfAttention, SegmentCrossAttention, SegmentClassifier
 
 
+def make_pyramid_dims(base_dim, n_layers, reduction_factor=2):
+    dims = [base_dim]
+    for i in range(1, n_layers):
+        prev = dims[-1]
+        next_dim = max(prev // reduction_factor, 1)
+        dims.append(next_dim)
+    return dims  # e.g. [64,32,16] for base_dim=64, n_layers=3
+
+class ResidualPyramidSelfAttention(nn.Module):
+    def __init__(self, in_dim, out_dim, n_heads):
+        super().__init__()
+        assert out_dim >= 1, "out_dim must be positive"
+        # MultiheadAttention requires query/key/value dims to match; choose internal_dim = max(in_dim, out_dim)
+        self.internal_dim = out_dim  # we will project input to out_dim for attention
+        self.proj_in = nn.Identity() if in_dim == self.internal_dim else nn.Linear(in_dim, self.internal_dim)
+        self.attn = nn.MultiheadAttention(self.internal_dim, n_heads, batch_first=True)
+        self.proj_out = nn.Identity()  # attention already produces out_dim-sized output
+        # If input and out_dim differ, residual needs projection
+        self.residual_proj = nn.Identity() if in_dim == out_dim else nn.Linear(in_dim, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, x):
+        # x: (B, S, in_dim)
+        residual = x
+        x_in = self.proj_in(x)  # -> (B, S, internal_dim == out_dim)
+        attn_out, attn_weights = self.attn(x_in, x_in, x_in, need_weights=True)  # (B, S, out_dim)
+        out = attn_out  # already in out_dim
+        # residual path
+        res = self.residual_proj(residual)  # (B, S, out_dim)
+        combined = out + res
+        normalized = self.norm(combined)
+        return normalized, attn_weights  # (B, S, out_dim), (B, S, S)
+
 class ResidualSegmentSelfAttention(nn.Module):
     def __init__(self, embed_dim: int, n_heads: int):
         super().__init__()
@@ -57,7 +90,8 @@ class SegmentReconModel(nn.Module):
         n_dec_layers: int = 2,
         num_segments: int = 10,
         seg_len: int = 26,
-        num_classes: int = 4
+        num_classes: int = 4,
+        reduction_factor: int = 2
     ):
         super().__init__()
         self.num_segments = num_segments
@@ -65,10 +99,25 @@ class SegmentReconModel(nn.Module):
         self.embed_dim = embed_dim
         # 1) 공유 인코더
         self.embedder = SegmentEmbedder(embed_dim)
-        self.enc_layers = nn.ModuleList([
-            ResidualSegmentSelfAttention(embed_dim, n_heads)
-            for _ in range(n_enc_layers)
-        ])
+        # self.enc_layers = nn.ModuleList([
+        #     ResidualSegmentSelfAttention(embed_dim, n_heads)
+        #     for _ in range(n_enc_layers)
+        # ])
+
+        # pyramid encoder dims
+        enc_dims = make_pyramid_dims(embed_dim, n_enc_layers, reduction_factor)
+        self.enc_layers = nn.ModuleList()
+        for i, dim in enumerate(enc_dims):
+            in_dim = enc_dims[i - 1] if i > 0 else embed_dim
+            # scale heads proportionally but ensure divisibility
+            heads = max(1, n_heads * dim // embed_dim)
+            while heads > 1 and dim % heads != 0:
+                heads -= 1
+            self.enc_layers.append(ResidualPyramidSelfAttention(in_dim, dim, heads))
+
+        final_enc_dim = enc_dims[-1]
+        self.to_decoder = nn.Linear(final_enc_dim, embed_dim) if final_enc_dim != embed_dim else nn.Identity()
+        self.to_cross = nn.Linear(final_enc_dim, embed_dim) if final_enc_dim != embed_dim else nn.Identity()
 
         # 2) 재구성 디코더 (reconstruction head)
         channels = [embed_dim] + [embed_dim // 2] * (n_dec_layers - 2) + [2]
@@ -90,7 +139,7 @@ class SegmentReconModel(nn.Module):
         #    세그먼트 임베딩을 평균(pool)한 뒤 FC
         self.classifier = SegmentClassifier(embed_dim, num_segments, num_classes)
 
-    def forward(self, x_sample, x_normal, classify=False, get_z=False):
+    def forward(self, x_sample, x_normal, classify=False, get_z=False, positional_encode=False):
         """
         Args:
             x: 원본 FFT 시퀀스, shape (B, 2, seg_len * num_segments)
@@ -105,8 +154,8 @@ class SegmentReconModel(nn.Module):
         segs = x_sample.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
         norm_seg = x_normal.unfold(2, self.seg_len, self.seg_len).permute(0, 2, 1, 3)
         # 2) 임베딩 → (B, S, D)
-        sample_embed = self.embedder(segs)
-        normal_embed = self.embedder(norm_seg)
+        sample_embed = self.embedder(segs, positional_encode)
+        normal_embed = self.embedder(norm_seg, positional_encode)
 
         # 3) Self-Attention 인코딩
         sample_attn = sample_embed
@@ -118,9 +167,17 @@ class SegmentReconModel(nn.Module):
             normal_attn, scores = attn(normal_attn)
             sample_scores_list.append(scores)
             normal_scores_list.append(scores)
-        
-        cross_attn_out, cross_score = self.cross_attn(sample_attn, normal_attn)
-        normal_cross_attn_out, normal_cross_score = self.cross_attn(normal_attn, normal_attn)
+        # 기존:
+        # cross_attn_out, cross_score = self.cross_attn(sample_attn, normal_attn)
+        # normal_cross_attn_out, normal_cross_score = self.cross_attn(normal_attn, normal_attn)
+
+        # 수정:
+        proj_sample_for_cross = self.to_cross(sample_attn)      # (B, S, embed_dim)
+        proj_normal_for_cross = self.to_cross(normal_attn)      # (B, S, embed_dim)
+
+        cross_attn_out, cross_score = self.cross_attn(proj_sample_for_cross, proj_normal_for_cross)
+        normal_cross_attn_out, normal_cross_score = self.cross_attn(proj_normal_for_cross, proj_normal_for_cross)
+
         if get_z:
             return sample_attn, normal_attn, cross_attn_out, normal_cross_attn_out, {
                 "sample_attn_scores_list": sample_scores_list,
@@ -129,10 +186,11 @@ class SegmentReconModel(nn.Module):
                 "normal_cross_scores": normal_cross_score
             }
 
-
+        # 추가된 부분
+        proj_sample_attn  = self.to_decoder(sample_attn)  # (B, S, embed_dim)
         # --- 재구성 헤드 ---
         # (B, S, D) → (B, D, S)
-        x = sample_attn.permute(0,2,1)
+        x = proj_sample_attn.permute(0,2,1)
         # 각 디코더 블록 적용
         for dec in self.dec_blocks:
             x = dec(x)
@@ -144,7 +202,8 @@ class SegmentReconModel(nn.Module):
             return recon, logits, {
                 "sample_attn_scores_list": sample_scores_list,
                 "normal_attn_scores_list": normal_scores_list,
-                "cross_attn_scores": cross_score
+                "cross_attn_scores": cross_score,
+                "cross_attn_out": cross_attn_out
             }
         return recon, {
                 "sample_attn_scores_list": sample_scores_list,
@@ -183,8 +242,8 @@ if __name__ == "__main__":
     recon, logits, scores = model(dummy_x, dummy_x2, classify=True)
     print(f"Recon shape: {recon.shape}, Logits shape: {logits.shape}")  # (B, 2, seg_len * num_segments), (B, num_classes)
     # latent z를 가져오기위해
-    recon_attn, norm_attn, scores = model(dummy_x, dummy_x2, classify=False, get_z=True)
-    print(f"Recon Attn shape: {recon_attn.shape}, Norm Attn shape: {norm_attn.shape}")  # (B, S, D)
+    sample_attn, normal_attn, cross_attn_out, normal_cross_attn_out, scores = model(dummy_x, dummy_x2, classify=False, get_z=True)
+    print(f"Recon Attn shape: {sample_attn.shape}, Norm Attn shape: {normal_attn.shape}")  # (B, S, D)
     loss_recon = recon_criterion(recon, dummy_x)
     loss_cls = cls_criterion(logits, dummy_y)
     # 멀티태스크 가중치: 재구성 0.5, 분류 0.5 (필요시 조정)
