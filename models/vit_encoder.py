@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torchvision.models import vit_b_16
+from torchvision.models import vit_b_16, ViT_B_16_Weights
 
 class VITEnClassify(nn.Module):
     """
@@ -8,18 +8,19 @@ class VITEnClassify(nn.Module):
 
     Args:
         num_classes (int): 분류할 클래스의 총 개수.
-        image_size (int): 입력 이미지의 높이와 너비. 기본값: 256.
+        image_size (int): 입력 이미지의 높이와 너비. 기본값: 224.
         patch_size (int): 이미지를 나눌 패치의 크기. 기본값: 16.
     """
-    def __init__(self, num_classes: int, image_size: int = 256, patch_size: int = 16):
+    def __init__(self, num_classes: int, image_size: int = 224, patch_size: int = 16, pretrained: bool = False):
         super().__init__()
         self.num_classes = num_classes
-        self.image_size = image_size
+        self.image_size = 224 if pretrained else image_size
         self.patch_size = patch_size
 
         # 1. 사전 학습되지 않은 ViT-Base 모델 구조를 로드합니다.
         # weights=None 으로 설정하여 가중치를 무작위로 초기화합니다.
-        self.vit = vit_b_16(weights=None, image_size=self.image_size)
+        weights = ViT_B_16_Weights.DEFAULT if pretrained else None
+        self.vit = vit_b_16(weights=weights, image_size=self.image_size)
 
         # 2. ViT의 첫 번째 레이어인 패치 프로젝션(Conv2d)을 4채널 입력에 맞게 수정합니다.
         # 기존 Conv2d의 출력 채널 수(hidden_dim)와 다른 파라미터는 유지합니다.

@@ -9,10 +9,18 @@ parameters:
     max: 0.001
     distribution: log_uniform_values
   epochs:
-    value: 50
-  stft_nperseg:
-    values: [256, 512, 1024, 2048]   # 범주형(이산)
-  stft_hop:
-    values: [128, 256, 512, 1024]    # 범주형(이산)
+    value: 100
+  stft_pair:
+    values:
+      - "256x128"
+      - "512x128"
+      - "512x256"
+      - "1024x128"
+      - "1024x256"
+      - "1024x512"
+      - "2048x128"
+      - "2048x256"
+      - "2048x512"
+      - "2048x1024"
   stft_power:
     values: [1.0, 2.0]
