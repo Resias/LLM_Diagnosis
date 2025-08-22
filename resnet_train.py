@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
-from models.vit_encoder import VITEnClassify
+from models.resnet_encoder import ResNetEnClassify
 from data.dataset import WindowedVibrationDataset, OrderInvariantSignalImager
 from sklearn.metrics import precision_score, recall_score, f1_score
 
@@ -189,8 +189,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
 
-
-
 def setup(rank, world_size, args):
     # 환경 변수 설정
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -346,12 +344,12 @@ def train_with_config(rank, world_size, args):
     device = torch.device(f"cuda:{rank}")
     
     # 모델 생성 및 DDP 설정
-    model = VITEnClassify(
-        num_classes=config.num_classes,
-        image_size=config.image_size,
-        patch_size=16,
+    model = ResNetEnClassify(
+        res_select=RES_SELECT,
+        num_classes=5,
+        image_size=output_size,
         pretrained=config.pretrained
-    ).to(device)
+    )
     
     if rank == 0:
         print(f"Creating model with {'pretrained' if config.pretrained else 'random'} initialization")
@@ -445,6 +443,8 @@ def parse_args():
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
                         help='Port for distributed training')
+    parser.add_argument('--model-select', type=int, default=18,
+                        help='Select ResNet model (18 or 50)')
 
     return parser.parse_args()
 
