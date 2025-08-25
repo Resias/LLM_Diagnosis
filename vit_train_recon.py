@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
-from models.vit_encoder import VITEnClassify
+from models.vit_encoder_recon import VITEnClassify, patchify
 from data.dataset import WindowedVibrationDataset, OrderInvariantSignalImager
 from sklearn.metrics import precision_score, recall_score, f1_score
 
@@ -19,12 +19,22 @@ import argparse
 import types
 
 
+def masked_patch_mse(rec_tokens, imgs, ids_keep, patch_size):
+    # rec_tokens: (N, L, P*P*C), target_tokens: 동일 크기
+    target_tokens = patchify(imgs, patch_size)  # (N, L, D)
+    N, L, D = target_tokens.shape
+    mask = torch.ones(N, L, device=target_tokens.device, dtype=torch.bool)
+    # keep 위치는 False(=가시), 나머지 True(=마스크)
+    mask.scatter_(1, ids_keep, False)
+    diff = (rec_tokens - target_tokens)[mask]   # 마스크 패치만
+    return (diff * diff).mean()
+
 def _ddp_sum_tensor(t):
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank):
+def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank):
     best_val_acc = 0.0
     is_main_process = rank == 0  # 메인 프로세스 여부 확인
     
@@ -49,17 +59,19 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         for inputs, labels in train_iter:
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            # print(labels)
+
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            # print(loss)
+            logits, rec_img, aux = model(inputs)
+            loss_cls = criterion(logits, labels)
+            loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
+
+            loss = alpha * loss_cls + (1 - alpha) * loss_rec
             loss.backward()
             optimizer.step()
             
             bs = labels.size(0)
             loss_sum_local += loss.item() * bs
-            _, pred = outputs.max(1)
+            _, pred = logits.max(1)
             correct_local += (pred == labels).sum().item()
             total_local += bs
 
@@ -104,12 +116,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         with torch.no_grad():
             for inputs, labels in val_loader:
                 inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
+                logits, rec_img, aux = model(inputs)
+                loss_cls = criterion(logits, labels)
+                loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
                 
+                loss = alpha * loss_cls + (1 - alpha) * loss_rec
                 bs = labels.size(0)
                 val_loss_sum_local += loss.item() * bs
-                _, pred = outputs.max(1)
+                _, pred = logits.max(1)
                 val_correct_local += (pred == labels).sum().item()
                 val_total_local += bs
                 val_preds_local.append(pred.detach())
@@ -117,7 +131,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         val_preds_local = torch.cat(val_preds_local, dim=0)
         val_labels_local = torch.cat(val_labels_local, dim=0)
-        val_preds_np  = val_preds_local.detach().cpu().numpy()
+        val_preds_np = val_preds_local.detach().cpu().numpy()
         val_labels_np = val_labels_local.detach().cpu().numpy()
         val_metrics = {}
         for avg in ["micro", "macro", "weighted"]:
@@ -141,7 +155,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 'train_loss': train_loss,
                 'train_acc': train_acc,
                 'val_loss': val_loss,
-                'val_acc': val_acc
+                'val_acc': val_acc,
+                "train/loss_cls": loss_cls.item(),
+                "train/loss_rec": loss_rec.item(),
             }
             # 🔹 sklearn PRF 추가 (있을 때만)
             if train_metrics is not None:
@@ -175,10 +191,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 os.makedirs('checkpoints', exist_ok=True)
+                state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
 
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': model.module.state_dict(),  # DDP unwrap
+                    'model_state_dict': state_dict,
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc,
                 }, os.path.join('checkpoints', 'best_model.pth'))
@@ -369,7 +386,8 @@ def train_with_config(rank, world_size, args):
         num_classes=config.num_classes,
         image_size=config.image_size,
         patch_size=16,
-        pretrained=config.pretrained
+        pretrained=config.pretrained,
+        model_size=config.model_size
     ).to(device)
     
     if rank == 0:
@@ -383,6 +401,7 @@ def train_with_config(rank, world_size, args):
     
     # 학습 실행
     train_model(
+        alpha=config.alpha,
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -443,23 +462,26 @@ def parse_args():
                         help='Path to the processed data directory')
     parser.add_argument('--sweep_config', type=str, default=None,
                         help='Path to wandb sweep configuration file')
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--image_size', type=int, default=256)
     parser.add_argument('--num_classes', type=int, default=5)
     parser.add_argument('--window_sec', type=float, default=5.0)
     parser.add_argument('--stride_sec', type=float, default=2.0)
     parser.add_argument('--max_order', type=float, default=10.0)
+    parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--stft_mode', type=str, default='stft+cross',
                         choices=['stft', 'stft+cross', 'stft_complex'])
-    parser.add_argument('--stft_nperseg', type=int, default=1024,
+    parser.add_argument('--model_size', type=str, default='b',
+                        choices=['b', 'l'])
+    parser.add_argument('--stft_nperseg', type=int, default=512,
                         help='Length of each STFT segment')
     parser.add_argument('--stft_hop', type=int, default=256,
                         help='Number of points between successive STFT segments')
     parser.add_argument('--stft_power', type=float, default=1.0,
                         help='Power of magnitude (1.0 for magnitude, 2.0 for power spectrum)')
-    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-ood')
+    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-recon')
     parser.add_argument('--pretrained', type=bool, default=False,
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,

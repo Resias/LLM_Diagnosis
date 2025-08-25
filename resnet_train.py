@@ -8,7 +8,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
-from models.vit_encoder import VITEnClassify
+from models.resnet_encoder import ResNetEnClassify
 from data.dataset import WindowedVibrationDataset, OrderInvariantSignalImager
 from sklearn.metrics import precision_score, recall_score, f1_score
 
@@ -17,6 +17,7 @@ import ast
 from tqdm import tqdm
 import argparse
 import types
+
 
 
 def _ddp_sum_tensor(t):
@@ -190,8 +191,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
 
-
-
 def setup(rank, world_size, args):
     # 환경 변수 설정
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -212,64 +211,74 @@ def cleanup():
     torch.distributed.destroy_process_group()
 
 def train_with_config(rank, world_size, args):
-    
     setup(rank, world_size, args)
-
-    # --- (1) 스윕 감지: 에이전트 실행 시 WANDB_SWEEP_ID 가 설정됨 ---
+    is_main = (rank == 0)
+    
+    # 스윕 여부 판단 (wandb agent가 설정하는 환경변수)
     is_sweep = bool(os.environ.get("WANDB_SWEEP_ID"))
-
-    # wandb 초기화 (메인 프로세스에서만)
-    if rank == 0:
+    
+    # rank0만 wandb.init (스윕이면 config를 절대 넘기지 않음)
+    if is_main:
         if is_sweep:
-            run = wandb.init(project=args.project_name, config=vars(args))
+            wandb.init(project=args.project_name)
         else:
-            # 일반 실행에서만 args를 config로 전달
             wandb.init(project=args.project_name, config=vars(args))
-    
-    # --- (B) rank0의 config(dict) -> 모든 rank로 브로드캐스트 ---
-    if rank == 0 and wandb.run is not None:
-        # sweep일 경우 wandb.config가 최종값을 담고 있으므로 그것을 기준으로
-        cfg_dict = dict(wandb.config)
-    else:
-        # 비-rank0는 임시로 args를 dict로
-        cfg_dict = vars(args).copy()
-    
-    obj_list = [cfg_dict]
-    dist.broadcast_object_list(obj_list, src=0)   # 모든 프로세스에 동일한 설정 전달
-    cfg_dict = obj_list[0]                        # 동기화된 최종 설정
 
-    # 모든 rank에서 공통으로 사용할 네임스페이스 구성
-    config = types.SimpleNamespace(**cfg_dict)
-    
-    # 1) stft_pair가 있으면 "NxM" 형식으로 파싱
-    if hasattr(config, "stft_pair") and config.stft_pair is not None:
-        n_str, h_str = str(config.stft_pair).lower().split("x")
-        config.stft_nperseg = int(n_str)
-        config.stft_hop = int(h_str)
-        if rank == 0 and wandb.run is not None:
+        # 1) rank0에서 최종 설정 만들기: args 기본값으로 시작 → 스윕값 덮어쓰기
+        merged = vars(args).copy()
+        if wandb.run is not None:
+            merged.update(dict(wandb.config))  # 스윕 값이 우선
+
+        # 2) stft_pair 정규화 (있으면 stft_nperseg/hop 생성·덮어쓰기)
+        stft_pair = merged.get("stft_pair", None)
+        if stft_pair is not None:
+            pair_str = str(stft_pair).lower()
+            try:
+                n_str, h_str = pair_str.split("x")
+                merged["stft_nperseg"] = int(n_str)
+                merged["stft_hop"]     = int(h_str)
+            except Exception as e:
+                raise ValueError(f"Invalid stft_pair format: {stft_pair} (expected 'NxM')") from e
+        else:
+            if "stft_nperseg" not in merged or "stft_hop" not in merged:
+                raise ValueError("Provide either stft_pair or both stft_nperseg and stft_hop.")
+
+        # (선택) wandb.config에 최종 하이퍼 파라미터 기록(로깅용)
+        if wandb.run is not None:
             wandb.config.update({
-                "stft_nperseg": config.stft_nperseg,
-                "stft_hop": config.stft_hop
+                "epochs": int(merged["epochs"]),
+                "batch_size": int(merged["batch_size"]),
+                "learning_rate": float(merged["learning_rate"]),
+                "stft_nperseg": int(merged["stft_nperseg"]),
+                "stft_hop": int(merged["stft_hop"]),
+                "model_select": int(merged.get("model_select", merged.get("model-select", 18))),
+                "pretrained": bool(merged.get("pretrained", False)),
+                "image_size": int(merged["image_size"]),
             }, allow_val_change=True)
+
+        # (디버그) 최종 설정 확인
+        print("[CONFIG/rank0]", merged)
+
     else:
-        config.stft_nperseg = int(config.stft_nperseg)
-        config.stft_hop = int(config.stft_hop)
+        merged = vars(args).copy()
+    
+    # ---- 모든 rank로 브로드캐스트 ----
+    obj_list = [merged]
+    dist.broadcast_object_list(obj_list, src=0)
+    merged = obj_list[0]
+    
+    # argparse 네임 규칙: --model-select → model_select 로 정규화
+    if "model_select" not in merged and "model-select" in merged:
+        merged["model_select"] = merged["model-select"]
 
-    setattr(config, "stft_nperseg", config.stft_nperseg)
-    setattr(config, "stft_hop", config.stft_hop)
-
-    # W&B 설정 업데이트는 rank0에서만
-    if rank == 0 and wandb.run is not None:
-        wandb.config.update({
-            "stft_nperseg": config.stft_nperseg,
-            "stft_hop": config.stft_hop
-        }, allow_val_change=True)
+    # 중요: 이후 전부 args만 사용하도록 덮어쓰기
+    args = types.SimpleNamespace(**merged)
 
     torch.cuda.set_device(rank)  # 각 프로세스의 GPU 설정
     device = torch.device(f"cuda:{rank}")
     
     # 데이터 준비
-    data_root = os.path.join(os.getcwd(), config.data_root)
+    data_root = os.path.join(os.getcwd(), args.data_root)
     meta_csv = os.path.join(data_root, 'meta.csv')
     meta_pd = pd.read_csv(meta_csv)
     
@@ -280,34 +289,34 @@ def train_with_config(rank, world_size, args):
     train_meta = meta_pd[meta_pd['dataset'] != 'dxai'].copy()
     val_meta = meta_pd[meta_pd['dataset'] == 'dxai'].copy()
     
-    if rank == 0:  # 메인 프로세스에서만 출력
-        print(f"\nTraining samples (non-IIS): {len(train_meta)}")
-        print(f"Validation samples (IIS): {len(val_meta)}")
+    if is_main:
+        print(f"\nTraining samples (non dxai): {len(train_meta)}")
+        print(f"Validation samples (dxai): {len(val_meta)}")
         print("\nTraining dataset distribution:")
         print(train_meta['dataset'].value_counts())
         print("\nValidation dataset distribution:")
         print(val_meta['dataset'].value_counts())
     
     # 이미지 변환기 설정 (pretrained 모델 사용 시 224x224로 강제)
-    output_size = 224 if config.pretrained else config.image_size
-    if rank == 0 and config.pretrained and config.image_size != 224:
+    output_size = 224 if bool(args.pretrained) else int(args.image_size)
+    if is_main and bool(args.pretrained) and int(args.image_size) != 224:
         print(f"Warning: Pretrained model requires 224x224 input. "
-              f"Automatically adjusting output size from {config.image_size} to 224.")
+              f"Automatically adjusting output size from {args.image_size} to 224.")
     
     signal_imger = OrderInvariantSignalImager(
-        mode=config.stft_mode,
+        mode=args.stft_mode,
         log1p=True,
         normalize="none",
         eps=1e-8,
         out_dtype=torch.float32,
-        max_order=config.max_order,
+        max_order=args.max_order,
         H_out=output_size,
         W_out=output_size,
-        stft_nperseg=config.stft_nperseg,
-        stft_hop=config.stft_hop,
+        stft_nperseg=args.stft_nperseg,
+        stft_hop=args.stft_hop,
         stft_window="hann",
         stft_center=True,
-        stft_power=config.stft_power,
+        stft_power=args.stft_power,
         # CWT
         cwt_wavelet="morl",
         cwt_num_scales=64,
@@ -318,8 +327,8 @@ def train_with_config(rank, world_size, args):
     train_dataset = WindowedVibrationDataset(
         meta_df=train_meta,
         data_root=data_root,
-        window_sec=config.window_sec,
-        stride_sec=config.stride_sec,
+        window_sec=args.window_sec,
+        stride_sec=args.stride_sec,
         cache_mode='none',
         transform=signal_imger
     )
@@ -328,8 +337,8 @@ def train_with_config(rank, world_size, args):
     val_dataset = WindowedVibrationDataset(
         meta_df=val_meta,
         data_root=data_root,
-        window_sec=config.window_sec,
-        stride_sec=config.stride_sec,
+        window_sec=args.window_sec,
+        stride_sec=args.stride_sec,
         cache_mode='none',
         transform=signal_imger
     )
@@ -350,12 +359,12 @@ def train_with_config(rank, world_size, args):
     
     # 데이터로더 생성
     train_loader = DataLoader(train_dataset, 
-                            batch_size=config.batch_size, 
+                            batch_size=args.batch_size, 
                             sampler=train_sampler,
                             num_workers=4,
                             pin_memory=True)
     val_loader = DataLoader(val_dataset, 
-                          batch_size=config.batch_size, 
+                          batch_size=args.batch_size, 
                           sampler=val_sampler,
                           num_workers=4,
                           pin_memory=True)
@@ -365,22 +374,23 @@ def train_with_config(rank, world_size, args):
     device = torch.device(f"cuda:{rank}")
     
     # 모델 생성 및 DDP 설정
-    model = VITEnClassify(
-        num_classes=config.num_classes,
-        image_size=config.image_size,
-        patch_size=16,
-        pretrained=config.pretrained
+    model = ResNetEnClassify(
+        res_select=args.model_select,
+        num_classes=args.num_classes,
+        image_size=output_size,
+        pretrained=args.pretrained
     ).to(device)
-    
-    if rank == 0:
-        print(f"Creating model with {'pretrained' if config.pretrained else 'random'} initialization")
-    
+
+    if is_main:
+        print(f"Creating model with {'pretrained' if args.pretrained else 'random'} initialization")
+
     model = DDP(model, device_ids=[rank], broadcast_buffers=False)
     
     # 손실 함수와 옵티마이저 설정
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
-    
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    num_epochs = int(args.epochs)
+
     # 학습 실행
     train_model(
         model=model,
@@ -388,7 +398,7 @@ def train_with_config(rank, world_size, args):
         val_loader=val_loader,
         criterion=criterion,
         optimizer=optimizer,
-        num_epochs=config.epochs,
+        num_epochs=num_epochs,
         device=device,
         rank=rank
     )
@@ -464,6 +474,8 @@ def parse_args():
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
                         help='Port for distributed training')
+    parser.add_argument('--model-select', type=int, default=18,
+                        help='Select ResNet model (18 or 50)')
 
     return parser.parse_args()
 

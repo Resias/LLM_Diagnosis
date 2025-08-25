@@ -1,4 +1,4 @@
-program: vit_train.py
+program: resnet_train.py
 method: bayes
 metric:
   name: val_acc
@@ -10,6 +10,8 @@ parameters:
     distribution: log_uniform_values
   epochs:
     value: 100
+  model_select:
+    values: [18, 50]
   stft_pair:
     values:
       - "512x256"

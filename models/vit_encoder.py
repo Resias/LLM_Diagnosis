@@ -67,7 +67,6 @@ if __name__ == '__main__':
     print(model)
     print("------------------------------------")
 
-
     # 더미(dummy) 입력 데이터 생성
     # 4개의 (B, 4, H, W) 형태의 텐서를 생성
     dummy_img = torch.randn(BATCH_SIZE, 4, IMAGE_SIZE, IMAGE_SIZE)
