@@ -16,6 +16,7 @@ import wandb
 import ast
 from tqdm import tqdm
 import argparse
+import types
 
 
 def _ddp_sum_tensor(t):
@@ -214,37 +215,55 @@ def train_with_config(rank, world_size, args):
     
     setup(rank, world_size, args)
 
+    # --- (1) 스윕 감지: 에이전트 실행 시 WANDB_SWEEP_ID 가 설정됨 ---
+    is_sweep = bool(os.environ.get("WANDB_SWEEP_ID"))
+
     # wandb 초기화 (메인 프로세스에서만)
     if rank == 0:
-        if wandb.run is None:  # sweep이 아닌 경우에만 새로 초기화
+        if is_sweep:
             run = wandb.init(project=args.project_name, config=vars(args))
-        config = wandb.config
+        else:
+            # 일반 실행에서만 args를 config로 전달
+            wandb.init(project=args.project_name, config=vars(args))
+    
+    # --- (B) rank0의 config(dict) -> 모든 rank로 브로드캐스트 ---
+    if rank == 0 and wandb.run is not None:
+        # sweep일 경우 wandb.config가 최종값을 담고 있으므로 그것을 기준으로
+        cfg_dict = dict(wandb.config)
     else:
-        config = args  # 다른 프로세스는 args를 직접 사용
+        # 비-rank0는 임시로 args를 dict로
+        cfg_dict = vars(args).copy()
+    
+    obj_list = [cfg_dict]
+    dist.broadcast_object_list(obj_list, src=0)   # 모든 프로세스에 동일한 설정 전달
+    cfg_dict = obj_list[0]                        # 동기화된 최종 설정
+
+    # 모든 rank에서 공통으로 사용할 네임스페이스 구성
+    config = types.SimpleNamespace(**cfg_dict)
     
     # 1) stft_pair가 있으면 "NxM" 형식으로 파싱
     if hasattr(config, "stft_pair") and config.stft_pair is not None:
-        pair_str = str(config.stft_pair).lower()
-        try:
-            n_str, h_str = pair_str.split("x")
-            parsed_n = int(n_str)
-            parsed_h = int(h_str)
-        except Exception as e:
-            raise ValueError(f"Invalid stft_pair format: {config.stft_pair} (expected 'NxM')") from e
-        nperseg = parsed_n
-        hop = parsed_h
+        n_str, h_str = str(config.stft_pair).lower().split("x")
+        config.stft_nperseg = int(n_str)
+        config.stft_hop = int(h_str)
+        if rank == 0 and wandb.run is not None:
+            wandb.config.update({
+                "stft_nperseg": config.stft_nperseg,
+                "stft_hop": config.stft_hop
+            }, allow_val_change=True)
     else:
-        # 2) stft_pair가 없으면 기존 필드 사용 (하위 호환)
-        if not (hasattr(config, "stft_nperseg") and hasattr(config, "stft_hop")):
-            raise ValueError("Provide either stft_pair or both stft_nperseg and stft_hop.")
-        nperseg = int(config.stft_nperseg)
-        hop     = int(config.stft_hop)
+        config.stft_nperseg = int(config.stft_nperseg)
+        config.stft_hop = int(config.stft_hop)
 
-    # wandb.config 직접 업데이트
-    wandb.config.update({
-        "stft_nperseg": nperseg,
-        "stft_hop": hop
-    }, allow_val_change=True)
+    setattr(config, "stft_nperseg", config.stft_nperseg)
+    setattr(config, "stft_hop", config.stft_hop)
+
+    # W&B 설정 업데이트는 rank0에서만
+    if rank == 0 and wandb.run is not None:
+        wandb.config.update({
+            "stft_nperseg": config.stft_nperseg,
+            "stft_hop": config.stft_hop
+        }, allow_val_change=True)
 
     torch.cuda.set_device(rank)  # 각 프로세스의 GPU 설정
     device = torch.device(f"cuda:{rank}")
