@@ -1,14 +1,14 @@
 import pandas as pd
 from tqdm import tqdm
 import ast
-import ast
 import numpy as np
 from torch.utils.data import Dataset
 import torch
 import os
 import matplotlib.pyplot as plt
 from scipy.signal import stft, get_window
-import pywt
+from scipy.signal import decimate
+from scipy.stats import kurtosis
 
 def _starts_for(n, win_n, stride_n, drop_last=True):
     if win_n <= 0 or stride_n <= 0: raise ValueError("win_n/stride_n must be > 0")
@@ -31,12 +31,21 @@ def rolling_windows_1d(a, win_n, stride_n):
 
 class WindowedVibrationDataset(Dataset):
     def __init__(
-        self, meta_df, data_root, window_sec, stride_sec,
+        self, data_root, window_sec, stride_sec,
+        using_dataset = ['dxai', 'iis', 'vat', 'vbl', 'mfd'],
         drop_last=True, dtype=torch.float32, transform=None,
-        channel_order=("x","y"), cache_mode="file"  # 'none' | 'file' | 'windows'
+        channel_order=("x","y"), cache_mode="file",  # 'none' | 'file' | 'windows'
     ):
-        self.meta_df = meta_df.reset_index(drop=True).copy()
         
+        meta_csv = os.path.join(data_root, 'meta.csv')
+        meta_pd = pd.read_csv(meta_csv)
+
+        meta_pd['sensor_position'] = meta_pd['sensor_position'].apply(ast.literal_eval)
+        meta_pd = meta_pd[5 <= meta_pd['data_sec']]
+        meta_pd = meta_pd[meta_pd['dataset'].isin(using_dataset)]
+        meta_pd['class_name'].unique()
+        
+        self.meta_df = meta_pd.reset_index(drop=True).copy()
         
         # 클래스 통합 매핑
         self.class_list = ['normal', 'unbalance', 'looseness', 'misalignment', 'bearing']
@@ -89,6 +98,7 @@ class WindowedVibrationDataset(Dataset):
         self._row_meta = {}      # per-row meta
         self._file_cache = {}    # cache_mode in ('file','windows'): row_idx -> np.ndarray or dict
         self._win_cache  = {}    # cache_mode == 'windows': row_idx -> (W, 2, win_n)
+        self.include_normal_ref = True  # always return a normal-reference sample from the same dataset & load_condition
 
         # 인덱스/캐시 준비
         print('caching dataset ... ')
@@ -134,52 +144,147 @@ class WindowedVibrationDataset(Dataset):
                 # as_strided view라 학습 중 쓰기 방지 위해 copy 권장
                 self._win_cache[row_idx] = win.copy()
 
-    def __len__(self):
-        return len(self.index_map)
+        # ---- Build normal-reference window pool: key = (dataset, load_condition) ----
+        self._normal_pool = {}  # (dataset, load_condition) -> list of (row_idx, start)
+        for n_row_idx, n_row in self.meta_df.iterrows():
+            if self.meta_df.loc[n_row_idx, 'merged_class'] != 'normal':
+                continue
+            sr_n = float(n_row["sampling_rate"])
+            win_n_n = int(round(self.window_sec * sr_n))
+            stride_n_n = int(round(self.stride_sec * sr_n))
+            starts_n = _starts_for(np.load(os.path.join(self.data_root, n_row["file_name"])).shape[1],
+                                   win_n_n, stride_n_n, self.drop_last)
+            key = (n_row["dataset"], n_row["load_condition"])
+            if key not in self._normal_pool:
+                self._normal_pool[key] = []
+            for s_n in starts_n:
+                self._normal_pool[key].append((n_row_idx, s_n))
+        # fallback pool by dataset only (if no matching load_condition exists)
+        self._normal_pool_by_ds = {}
+        for n_row_idx, n_row in self.meta_df.iterrows():
+            if self.meta_df.loc[n_row_idx, 'merged_class'] != 'normal':
+                continue
+            sr_n = float(n_row["sampling_rate"])
+            win_n_n = int(round(self.window_sec * sr_n))
+            stride_n_n = int(round(self.stride_sec * sr_n))
+            starts_n = _starts_for(np.load(os.path.join(self.data_root, n_row["file_name"])).shape[1],
+                                   win_n_n, stride_n_n, self.drop_last)
+            key_ds = (n_row["dataset"],)
+            if key_ds not in self._normal_pool_by_ds:
+                self._normal_pool_by_ds[key_ds] = []
+            for s_n in starts_n:
+                self._normal_pool_by_ds[key_ds].append((n_row_idx, s_n))
 
-    def __getitem__(self, idx, return_info=False):
-        row_idx, start = self.index_map[idx]
+    def _extract_segment(self, row_idx, start):
+        """Return (seg ndarray shape (2, win_n)) for the given row & start, respecting cache_mode."""
         row = self.meta_df.iloc[row_idx]
         meta = self._row_meta[row_idx]
         sr, x_idx, y_idx, win_n = meta["sr"], meta["x_idx"], meta["y_idx"], meta["win_n"]
-
         if self.cache_mode == "none":
             arr = np.load(meta["file_path"], mmap_mode="r")
             x_seg = arr[x_idx, start:start+win_n]
             y_seg = arr[y_idx, start:start+win_n]
-            seg = np.stack([x_seg, y_seg], axis=0) if self.channel_order==("x","y") \
-                  else np.stack([y_seg, x_seg], axis=0)
-
         elif self.cache_mode == "file":
-            base = self._file_cache[row_idx]                   # (S, N) in RAM
+            base = self._file_cache[row_idx]
             x_seg = base[x_idx, start:start+win_n]
             y_seg = base[y_idx, start:start+win_n]
-            seg = np.stack([x_seg, y_seg], axis=0) if self.channel_order==("x","y") \
-                  else np.stack([y_seg, x_seg], axis=0)
-
         else:  # 'windows'
-            win = self._win_cache[row_idx]                     # (W, 2, win_n)
-            # start는 샘플 인덱스, 윈도우 인덱스로 변환
             stride_n = int(round(self.stride_sec * sr))
             widx = (start // stride_n)
-            seg = win[widx]  # (2, win_n)
+            win = self._win_cache[row_idx]  # (W, 2, win_n)
+            seg = win[widx]
+            # ensure correct channel order
+            if self.channel_order == ("x","y"):
+                return seg
+            else:
+                return seg[::-1]
+        seg = np.stack([x_seg, y_seg], axis=0) if self.channel_order==("x","y") \
+              else np.stack([y_seg, x_seg], axis=0)
+        return seg
 
-        info = {
-            "sampling_rate": sr,
-            "rpm": float(row["rpm"]),
-            "label_class": row["class_name"],
-            "severity": row["severity"],
-            "load_condition": row["load_condition"],
-            "dataset": row["dataset"]
-        }
-        
+    def _pick_normal_reference(self, dataset, load_condition):
+        """Return (row_idx, start) of a normal sample matching (dataset, load_condition) if available,
+        otherwise same dataset only, otherwise None."""
+        key = (dataset, load_condition)
+        pool = self._normal_pool.get(key)
+        if pool:
+            ridx, s = pool[np.random.randint(len(pool))]
+            return ridx, s
+        # fallback by dataset only
+        key_ds = (dataset,)
+        pool2 = self._normal_pool_by_ds.get(key_ds)
+        if pool2:
+            ridx, s = pool2[np.random.randint(len(pool2))]
+            return ridx, s
+        return None
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx, data_info=False):
+        row_idx, start = self.index_map[idx]
+        row = self.meta_df.iloc[row_idx]
+        meta = self._row_meta[row_idx]
+        sr = meta["sr"]
+
+        # ---- current segment ----
+        seg = self._extract_segment(row_idx, start)
         tensor_img = self.transform(seg, sr=sr, rpm=float(row["rpm"]))
         class_idx = self.class_list.index(row['merged_class'])
         tensor_cls = torch.tensor(class_idx ,dtype=torch.long)
-        if return_info:
-            return tensor_img, tensor_cls, info
+
+        info = {
+            "sampling_rate": float(sr),
+            "rpm": float(row["rpm"]),
+            "label_class": row["class_name"],
+            "merged_class": row["merged_class"],
+            "severity": row["severity"],
+            "load_condition": row["load_condition"],
+            "dataset": row["dataset"],
+            "file_name": row["file_name"],
+        }
+
+        # ---- normal reference (same dataset & load_condition) ----
+        normal_tuple = None
+        if self.include_normal_ref:
+            pick = self._pick_normal_reference(row["dataset"], row["load_condition"])
+            if pick is not None:
+                n_row_idx, n_start = pick
+                n_row = self.meta_df.iloc[n_row_idx]
+                n_meta = self._row_meta[n_row_idx]
+                n_sr = n_meta["sr"]
+                n_seg = self._extract_segment(n_row_idx, n_start)
+                tensor_img_norm = self.transform(n_seg, sr=n_sr, rpm=float(n_row["rpm"]))
+                tensor_cls_norm = torch.tensor(self.class_list.index('normal'), dtype=torch.long)
+                n_info = {
+                    "sampling_rate": float(n_sr),
+                    "rpm": float(n_row["rpm"]),
+                    "label_class": n_row["class_name"],
+                    "merged_class": n_row["merged_class"],
+                    "severity": n_row["severity"],
+                    "load_condition": n_row["load_condition"],
+                    "dataset": n_row["dataset"],
+                    "file_name": n_row["file_name"],
+                }
+                normal_tuple = (tensor_img_norm, tensor_cls_norm, n_info)
+
+        if not data_info:
+            if normal_tuple is None:
+                return tensor_img, tensor_cls
+            else:
+                tensor_img_norm, tensor_cls_norm, _ = normal_tuple
+                return tensor_img, tensor_cls, tensor_img_norm, tensor_cls_norm
+
+        # ---- knowledge strings when data_info=True ----
+        cur_kn = _build_knowledge_string(seg, sr=float(sr), rpm=float(row["rpm"]))
+        info["knowledge"] = cur_kn
+        if normal_tuple is not None:
+            _, _, n_info = normal_tuple
+            n_kn = _build_knowledge_string(n_seg, sr=float(n_sr), rpm=float(n_row["rpm"]))
+            n_info["knowledge"] = n_kn
+            return tensor_img, tensor_cls, info, normal_tuple[0], normal_tuple[1], n_info
         else:
-            return tensor_img, tensor_cls
+            return tensor_img, tensor_cls, info
 
 class OrderInvariantSignalImager:
     """
@@ -215,14 +320,9 @@ class OrderInvariantSignalImager:
         stft_window="hann",
         stft_center=True,
         stft_power=1.0,           # 1: magnitude, 2: power
-        # CWT
-        cwt_wavelet="morl",
-        cwt_num_scales=64,
-        cwt_scale_base=2.0,
     ):
         assert mode in {
             "stft", "stft+cross", "stft_complex",
-            "cwt",  "cwt+cross",  "cwt_complex",
         }
         self.mode = mode
         self.log1p = log1p
@@ -239,9 +339,6 @@ class OrderInvariantSignalImager:
         self.stft_center = stft_center
         self.stft_power = stft_power
 
-        self.cwt_wavelet = cwt_wavelet
-        self.cwt_num_scales = cwt_num_scales
-        self.cwt_scale_base = cwt_scale_base
 
     # ---------- 유틸 ----------
     def _apply_log_norm(self, x: np.ndarray) -> np.ndarray:
@@ -341,47 +438,6 @@ class OrderInvariantSignalImager:
         arr = np.stack(chans, axis=0)  # (C, F, T)
         return f, t, arr
 
-    # ---------- CWT ----------
-    def _cwt_xy(self, x: np.ndarray, y: np.ndarray, sr: float):
-        scales = self.cwt_scale_base ** np.linspace(
-            np.log(2)/np.log(self.cwt_scale_base),
-            np.log(self.cwt_num_scales+1)/np.log(self.cwt_scale_base),
-            self.cwt_num_scales
-        ).astype(np.float32)
-        Wx, fx = pywt.cwt(x, scales, self.cwt_wavelet, sampling_period=1.0/sr)
-        Wy, fy = pywt.cwt(y, scales, self.cwt_wavelet, sampling_period=1.0/sr)
-        # fx, fy는 동일해야 함
-        return scales, fx, Wx, Wy
-
-    def _build_cwt_maps(self, seg: np.ndarray, sr: float):
-        x, y = seg[0], seg[1]
-        if self.mode == "cwt":
-            _, f, Wx, Wy = self._cwt_xy(x, y, sr)
-            Xabs, Yabs = np.abs(Wx), np.abs(Wy)
-            chans = [Xabs, Yabs]
-        elif self.mode == "cwt+cross":
-            _, f, Wx, Wy = self._cwt_xy(x, y, sr)
-            Xabs, Yabs = np.abs(Wx), np.abs(Wy)
-            Wxy = Wx * np.conj(Wy)
-            cross_abs = np.abs(Wxy)
-            phase_cos = np.cos(np.angle(Wxy))
-            chans = [Xabs, Yabs, cross_abs, phase_cos]
-        else:  # "cwt_complex"
-            z = x + 1j*y
-            scales = self.cwt_scale_base ** np.linspace(
-                np.log(2)/np.log(self.cwt_scale_base),
-                np.log(self.cwt_num_scales+1)/np.log(self.cwt_scale_base),
-                self.cwt_num_scales
-            ).astype(np.float32)
-            Wz, f = pywt.cwt(z, scales, self.cwt_wavelet, sampling_period=1.0/sr)
-            amp = np.abs(Wz)
-            phase = np.angle(Wz)
-            phase_cos = np.cos(phase)
-            phase_sin = np.sin(phase)
-            phase_dev90 = phase - (np.pi/2)
-            chans = [amp, phase_cos, phase_sin, phase_dev90]
-        arr = np.stack(chans, axis=0)  # (C, S, T)
-        return f, arr
 
     # ---------- 호출 ----------
     def __call__(self, seg: np.ndarray, sr: float, rpm: float) -> torch.Tensor:
@@ -393,8 +449,8 @@ class OrderInvariantSignalImager:
             f, t, arr = self._build_stft_maps(seg, sr)  # arr: (C, F, T)
             order = f / f_rot                            # (F,)
         else:
-            f, arr = self._build_cwt_maps(seg, sr)      # arr: (C, S, T)
-            order = f / f_rot                            # (S,)
+            print('err')
+            exit()
         # 2) order 마스킹 (0 < order ≤ max_order)
         mask = (order > 0) & (order <= self.max_order)
         if not np.any(mask):
@@ -428,12 +484,6 @@ def _channel_labels_for_mode(mode: str):
         return ["|X|^p", "|Y|^p", "|X·Y*|", "cos(Δφ)"]
     if mode == "stft_complex":
         return ["|Z|", "cos(∠Z)", "sin(∠Z)", "∠Z − 90°"]
-    if mode == "cwt":
-        return ["|Wx|", "|Wy|"]
-    if mode == "cwt+cross":
-        return ["|Wx|", "|Wy|", "|Wx·Wy*|", "cos(Δφ)"]
-    if mode == "cwt_complex":
-        return ["|Wz|", "cos(∠Wz)", "sin(∠Wz)", "∠Wz − 90°"]
     # fallback
     return [f"ch{i}" for i in range(16)]
 
@@ -508,51 +558,123 @@ def visualize_imaging_tensor(
         fig.savefig(save_path, dpi=150)
     plt.close(fig) if save_path else plt.show()
 
+# ---- Helper for knowledge string ----
+def _dominant_order_peaks(seg, sr, rpm, k=3, tol=0.15, ds_factor=4, seg_factor=4, sec_win=1.0):
+    """
+    Compute dominant spectral peaks using ensemble averaging to reduce noise.
+    Steps:
+      1) Optional downsampling by ds_factor (default 4).
+      2) Split the signal into `seg_factor` contiguous segments (default 4).
+      3) Within each segment, cut into non-overlapping windows of `sec_win` seconds (default 1.0s).
+      4) Compute Hann-windowed rFFT magnitude of each window and average across all windows.
+      5) Return top-k peak frequencies and their proximity to 1x/2x/3x orders.
 
-if __name__ == '__main__':
-    data_root = os.path.join(os.getcwd(), 'processed')
-    meta_csv = os.path.join(data_root, 'meta.csv')
-    meta_pd = pd.read_csv(meta_csv)
+    Returns: dict with
+      - peaks_hz: list of top-k peak frequencies (Hz)
+      - orders: list of their order values (peak_hz / f_rot)
+      - near_1x / near_2x / near_3x: boolean flags
+    """
+    x = np.asarray(seg[0], dtype=float)
+    if x.size == 0 or sr <= 0 or rpm <= 0:
+        return {"peaks_hz": [], "orders": [], "near_1x": False, "near_2x": False, "near_3x": False}
 
-    meta_pd['sensor_position'] = meta_pd['sensor_position'].apply(ast.literal_eval)
-    meta_pd = meta_pd[5 <= meta_pd['data_sec']]
-    
-    # 필요한 데이터셋만 남기고 나머지는 제거
-    using_dataset = ['dxai', 'iis', 'vat', 'vbl', 'mfd']
-    meta_pd = meta_pd[meta_pd['dataset'].isin(using_dataset)]
-    print(f'Filtered metadata to {len(meta_pd)} rows with datasets in {using_dataset}')
+    # 1) Downsample (zero-phase IIR decimation to suppress aliasing)
+    sr_eff = float(sr)
+    if ds_factor and ds_factor > 1:
+        try:
+            x = decimate(x, ds_factor, ftype='iir', zero_phase=True)
+            sr_eff = sr_eff / ds_factor
+        except Exception:
+            # Fallback: naive decimation if scipy version lacks zero_phase
+            x = x[::ds_factor]
+            sr_eff = sr_eff / ds_factor
 
-    signal_imger = OrderInvariantSignalImager(
-        mode='cwt+cross',
-        log1p=True,
-        normalize="per_channel",  # None | "per_channel" | "global"
-        eps=1e-8,
-        out_dtype=torch.float32,
-        max_order=20.0,           # order 축 상한
-        H_out=256,                # order-bin 수
-        W_out=256,                # time-bin 수
-        # STFT
-        stft_nperseg=1024,
-        stft_hop=256,
-        stft_window="hann",
-        stft_center=True,
-        stft_power=1.0,           # 1: magnitude, 2: power
-        # CWT
-        cwt_wavelet="morl",
-        cwt_num_scales=64,
-        cwt_scale_base=2.0,
-    )
+    n_total = x.shape[0]
+    if n_total < int(sec_win * sr_eff):
+        # Not enough samples for a 1-second window; fall back to plain rFFT
+        freqs = np.fft.rfftfreq(n_total, d=1.0/sr_eff)
+        mag = np.abs(np.fft.rfft(x))
+        if mag.size > 0:
+            mag[0] = 0.0
+    else:
+        # 2) Split into seg_factor segments
+        seg_factor = max(1, int(seg_factor))
+        seg_len = n_total // seg_factor
+        window_n = int(round(sec_win * sr_eff))
+        if window_n <= 0: window_n = min(n_total, 1024)
 
-    dataset = WindowedVibrationDataset(
-        meta_df=meta_pd,
-        data_root=data_root,
-        window_sec=5,
-        stride_sec=2,
-        cache_mode='file',
-        transform=signal_imger
-    )
-    
-    # 단일 샘플 미리보기
-    t0, y = dataset[100]  # (C,H,W)
-    # print(info)
-    visualize_imaging_tensor(t0, mode="cwt+cross", max_order=20, window_sec=5.0, save_path='test')
+        # 3) Within each segment, cut into non-overlapping 1s windows and accumulate spectra
+        acc_mag = None
+        count = 0
+        hann = np.hanning(window_n)
+        for s in range(seg_factor):
+            start = s * seg_len
+            end = start + seg_len if s < seg_factor - 1 else n_total
+            seg_x = x[start:end]
+            m = seg_x.shape[0] // window_n
+            for i in range(m):
+                w = seg_x[i*window_n:(i+1)*window_n]
+                w = w - np.mean(w)
+                W = np.fft.rfft(w * hann)
+                mag_w = np.abs(W)
+                if acc_mag is None:
+                    acc_mag = mag_w
+                else:
+                    # Align length in case of minor rounding differences
+                    L = min(acc_mag.shape[0], mag_w.shape[0])
+                    acc_mag = acc_mag[:L] + mag_w[:L]
+                count += 1
+        if count == 0:
+            # Fallback to whole-signal FFT
+            freqs = np.fft.rfftfreq(n_total, d=1.0/sr_eff)
+            mag = np.abs(np.fft.rfft(x))
+        else:
+            mag = acc_mag / float(count)
+            freqs = np.fft.rfftfreq(window_n, d=1.0/sr_eff)
+        if mag.size > 0:
+            mag[0] = 0.0
+
+    # 4) Pick top-k peaks by magnitude
+    if mag.size == 0:
+        return {"peaks_hz": [], "orders": [], "near_1x": False, "near_2x": False, "near_3x": False}
+    k = max(1, int(k))
+    idx = np.argsort(mag)[-k:]
+    idx = idx[np.argsort(freqs[idx])]
+    peaks_hz = freqs[idx].tolist()
+
+    # 5) Map to orders and proximity checks
+    f_rot = rpm / 60.0
+    orders = [p / f_rot if f_rot > 0 else 0.0 for p in peaks_hz]
+    def near(o, target): return abs(o - target) <= tol
+    near_flags = {
+        "near_1x": any(near(o, 1.0) for o in orders),
+        "near_2x": any(near(o, 2.0) for o in orders),
+        "near_3x": any(near(o, 3.0) for o in orders),
+    }
+    return {"peaks_hz": [float(p) for p in peaks_hz], "orders": [float(o) for o in orders], **near_flags}
+
+def _build_knowledge_string(seg, sr, rpm):
+    """
+    Build a compact textual summary for RAG/LLM reasoning from a window segment.
+    Includes RMS, kurtosis, crest factor, and dominant order peaks proximity.
+    """
+    x = seg[0]; y = seg[1]
+    def _rms(a): return float(np.sqrt(np.mean(a**2) + 1e-12))
+    def _crest(a):
+        r = _rms(a)
+        return float((np.max(np.abs(a)) / (r + 1e-12)) if r > 0 else 0.0)
+    rms_x, rms_y = _rms(x), _rms(y)
+    k_x = float(kurtosis(x, fisher=False, bias=False)) if x.size > 8 else 3.0
+    k_y = float(kurtosis(y, fisher=False, bias=False)) if y.size > 8 else 3.0
+    cf_x, cf_y = _crest(x), _crest(y)
+    dom = _dominant_order_peaks(seg, sr, rpm, k=5, ds_factor=4, seg_factor=4, sec_win=1.0)
+    parts = [
+        f"sr={sr:.1f}Hz, rpm={rpm:.1f}, f_rot={rpm/60.0:.3f}Hz",
+        f"RMS(x,y)=({rms_x:.4g},{rms_y:.4g})",
+        f"Kurtosis(x,y)=({k_x:.3g},{k_y:.3g})",
+        f"CrestFactor(x,y)=({cf_x:.3g},{cf_y:.3g})",
+        f"TopPeaksHz={','.join(f'{p:.2f}' for p in dom['peaks_hz'])}",
+        f"Orders={','.join(f'{o:.2f}' for o in dom['orders'])}",
+        f"near(1x)={dom['near_1x']}, near(2x)={dom['near_2x']}, near(3x)={dom['near_3x']}",
+    ]
+    return " | ".join(parts)
