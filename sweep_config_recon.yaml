@@ -1,0 +1,18 @@
+program: vit_train_recon.py
+method: bayes
+metric:
+  name: val_acc
+  goal: maximize
+parameters:
+  learning_rate:
+    min: 0.0001
+    max: 0.001
+    distribution: log_uniform_values
+  stft_power:
+    values: [1.0, 2.0]
+  model_size:
+    values: ['b', 'l']
+  alpha:
+    min: 0.2
+    max: 0.8
+    distribution: log_uniform_values
