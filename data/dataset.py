@@ -221,7 +221,7 @@ class WindowedVibrationDataset(Dataset):
     def __len__(self):
         return len(self.index_map)
 
-    def __getitem__(self, idx, data_info=False):
+    def __getitem__(self, idx, data_info=True):
         row_idx, start = self.index_map[idx]
         row = self.meta_df.iloc[row_idx]
         meta = self._row_meta[row_idx]
@@ -259,12 +259,12 @@ class WindowedVibrationDataset(Dataset):
                 n_info = {
                     "sampling_rate": float(n_sr),
                     "rpm": float(n_row["rpm"]),
-                    "label_class": n_row["class_name"],
-                    "merged_class": n_row["merged_class"],
-                    "severity": n_row["severity"],
-                    "load_condition": n_row["load_condition"],
-                    "dataset": n_row["dataset"],
-                    "file_name": n_row["file_name"],
+                    "label_class": str(n_row["class_name"]),
+                    "merged_class": str(n_row["merged_class"]),
+                    "severity": str(n_row["severity"]),
+                    "load_condition": str(n_row["load_condition"]),
+                    "dataset": str(n_row["dataset"]),
+                    "file_name": str(n_row["file_name"]),
                 }
                 normal_tuple = (tensor_img_norm, tensor_cls_norm, n_info)
 
