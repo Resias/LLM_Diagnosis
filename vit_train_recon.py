@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -11,6 +12,8 @@ from torch.utils.data.distributed import DistributedSampler
 from models.vit_encoder_recon import VITEnClassify, patchify
 from data.dataset import WindowedVibrationDataset, OrderInvariantSignalImager
 from sklearn.metrics import precision_score, recall_score, f1_score
+from utils.visualize import create_reconstruction_figure
+import matplotlib.pyplot as plt
 
 import wandb
 import ast
@@ -34,7 +37,7 @@ def _ddp_sum_tensor(t):
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t
 
-def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank):
+def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank, config):
     best_val_acc = 0.0
     is_main_process = rank == 0  # 메인 프로세스 여부 확인
     
@@ -46,28 +49,51 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             val_loader.sampler.set_epoch(epoch)
         # Training phase
         model.train()
-
+        
         if is_main_process:
             train_iter = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', leave=False)
         else:
             train_iter = train_loader
+        
         loss_sum_local = 0.0   # sum of loss * batch_size
         correct_local  = 0.0
         total_local    = 0.0
         train_preds_local = []
         train_labels_local = []
         
-        for inputs, labels in train_iter:
+        embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch = [], [], [], []
+        reconstruction_image_to_log = None
+        
+        # dataset에서 getitem에 인자 true로 설정해놓으면 아래와 같이 info도 같이 줌
+        for i, batch in enumerate(train_iter):
+            if len(batch) == 3:
+                inputs, labels, info = batch
+            else:
+                inputs, labels, info, inputs_n, labels_n, info_n = batch
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            logits, rec_img, aux = model(inputs)
+            logits, rec_img, aux, cls_feat = model(inputs, return_feats=True)
             loss_cls = criterion(logits, labels)
             loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
 
             loss = alpha * loss_cls + (1 - alpha) * loss_rec
             loss.backward()
             optimizer.step()
+
+            # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
+            if is_main_process and i == 0 and wandb.run is not None:
+                # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0])
+                fig = create_reconstruction_figure(
+                    orig_tensor=inputs[0],
+                    rec_tensor=rec_img[0],
+                    mode=config.stft_mode,  # config에서 파라미터 가져오기
+                    max_order=config.max_order,
+                    window_sec=config.window_sec
+                )
+                # Figure를 wandb.Image 객체로 변환
+                reconstruction_image_to_log = wandb.Image(fig)
+                plt.close(fig)
             
             bs = labels.size(0)
             loss_sum_local += loss.item() * bs
@@ -77,6 +103,11 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
             train_preds_local.append(pred.detach())
             train_labels_local.append(labels.detach())
+
+            embeds_epoch.append(cls_feat.detach().cpu())    # (B, D)
+            y_true_epoch.append(labels.detach().cpu())
+            y_pred_epoch.append(pred.detach().cpu())
+            ds_epoch.extend(list(info["dataset"]))
 
             if is_main_process:
                 avg_loss_so_far = loss_sum_local / max(total_local, 1)
@@ -105,6 +136,49 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         train_loss = (t_train[0] / t_train[2]).item() if t_train[2] > 0 else 0.0
         train_acc  = (t_train[1] / t_train[2] * 100.0).item() if t_train[2] > 0 else 0.0
 
+        # (3) 배치들 concat
+        embeds_epoch = torch.cat(embeds_epoch, dim=0)    # (M, D)
+        y_true_epoch = torch.cat(y_true_epoch, dim=0)    # (M,)
+        y_pred_epoch = torch.cat(y_pred_epoch, dim=0)    # (M,)
+        ds_epoch = np.array(ds_epoch)                    # (M,)
+        
+        project_cols = ("embedding", "pred", "label", "dataset", "split", "epoch")
+        # (5) rank0만 로깅
+        max_points = 3000
+        M = embeds_epoch.shape[0]
+        if M > max_points:
+            idx = torch.randperm(M)[:max_points]
+            embeds_s = embeds_epoch[idx]
+            ytrue_s = y_true_epoch[idx]
+            ypred_s = y_pred_epoch[idx]
+            # 리스트는 인덱싱으로 맞춰 재배치
+            idx_np = idx.cpu().numpy().tolist()
+            ds_s    = [ds_epoch[i] for i in idx_np]
+        else:
+            embeds_s, ytrue_s, ypred_s, ds_s = embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch
+
+        if rank == 0 and wandb.run is not None:
+            # W&B Table (M rows)
+            # 권장: Table 로깅 모드 지정 (INCREMENTAL/MUTABLE/IMMUTABLE) – 최근 가이드 참고
+            # https://docs.wandb.ai/guides/models/tables/log_tables/
+            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+
+            E = embeds_s.cpu().numpy().tolist()
+            P = ypred_s.cpu().numpy().tolist()
+            Y = ytrue_s.cpu().numpy().tolist()
+
+            for i in range(len(E)):
+                table.add_data(
+                    E[i],
+                    int(P[i]),
+                    int(Y[i]),
+                    ds_s[i],
+                    "train",
+                    int(epoch))
+            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+            # https://docs.wandb.ai/guides/track/limits/
+            wandb.log({f"embeddings/train": table, "epoch": int(epoch)})
+
         # Validation phase
         model.eval()
         val_loss_sum_local = 0.0
@@ -113,21 +187,49 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         val_preds_local = []
         val_labels_local = []
 
+        embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch = [], [], [], []
+        val_reconstruction_image_to_log = None
+
         with torch.no_grad():
-            for inputs, labels in val_loader:
+            for i, batch  in enumerate(val_loader):
+                if len(batch) == 3:
+                    inputs, labels, info = batch
+                else:
+                    inputs, labels, info, inputs_n, labels_n, info_n = batch
                 inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                logits, rec_img, aux = model(inputs)
-                loss_cls = criterion(logits, labels)
-                loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
+                logits, rec_img, aux, cls_feat = model(inputs, return_feats=True)
+                b_loss_cls = criterion(logits, labels)
+                b_loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
                 
-                loss = alpha * loss_cls + (1 - alpha) * loss_rec
+                b_loss = alpha * b_loss_cls + (1 - alpha) * b_loss_rec
+
+                # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
+                if is_main_process and i == 0 and wandb.run is not None:
+                    # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0])
+                    fig = create_reconstruction_figure(
+                        orig_tensor=inputs[0],
+                        rec_tensor=rec_img[0],
+                        mode=config.stft_mode,  # config에서 파라미터 가져오기
+                        max_order=config.max_order,
+                        window_sec=config.window_sec
+                    )
+                    # Figure를 wandb.Image 객체로 변환
+                    val_reconstruction_image_to_log = wandb.Image(fig)
+                    plt.close(fig)
+
+
                 bs = labels.size(0)
-                val_loss_sum_local += loss.item() * bs
+                val_loss_sum_local += b_loss.item() * bs
                 _, pred = logits.max(1)
                 val_correct_local += (pred == labels).sum().item()
                 val_total_local += bs
                 val_preds_local.append(pred.detach())
                 val_labels_local.append(labels.detach())
+                
+                embeds_epoch.append(cls_feat.detach().cpu())    # (B, D)
+                y_true_epoch.append(labels.detach().cpu())
+                y_pred_epoch.append(pred.detach().cpu())
+                ds_epoch.extend(list(info["dataset"]))
         
         val_preds_local = torch.cat(val_preds_local, dim=0)
         val_labels_local = torch.cat(val_labels_local, dim=0)
@@ -145,6 +247,51 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         val_loss = (t_val[0] / t_val[2]).item() if t_val[2] > 0 else 0.0
         val_acc  = (t_val[1] / t_val[2] * 100.0).item() if t_val[2] > 0 else 0.0
 
+
+        # (3) 배치들 concat
+        embeds_epoch = torch.cat(embeds_epoch, dim=0)    # (M, D)
+        y_true_epoch = torch.cat(y_true_epoch, dim=0)    # (M,)
+        y_pred_epoch = torch.cat(y_pred_epoch, dim=0)    # (M,)
+        ds_epoch = np.array(ds_epoch)                    # (M,)
+        
+        project_cols = ("embedding", "pred", "label", "dataset", "split", "epoch")
+        # (5) rank0만 로깅
+        max_points = 3000
+        M = embeds_epoch.shape[0]
+        if M > max_points:
+            idx = torch.randperm(M)[:max_points]
+            embeds_s = embeds_epoch[idx]
+            ytrue_s = y_true_epoch[idx]
+            ypred_s = y_pred_epoch[idx]
+            # 리스트는 인덱싱으로 맞춰 재배치
+            idx_np = idx.cpu().numpy().tolist()
+            ds_s    = [ds_epoch[i] for i in idx_np]
+        else:
+            embeds_s, ytrue_s, ypred_s, ds_s = embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch
+
+        if rank == 0 and wandb.run is not None:
+            # W&B Table (M rows)
+            # 권장: Table 로깅 모드 지정 (INCREMENTAL/MUTABLE/IMMUTABLE) – 최근 가이드 참고
+            # https://docs.wandb.ai/guides/models/tables/log_tables/
+            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+
+            E = embeds_s.cpu().numpy().tolist()
+            P = ypred_s.cpu().numpy().tolist()
+            Y = ytrue_s.cpu().numpy().tolist()
+
+            for i in range(len(E)):
+                table.add_data(
+                    E[i],
+                    int(P[i]),
+                    int(Y[i]),
+                    ds_s[i],
+                    "val",
+                    int(epoch))
+            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+            # https://docs.wandb.ai/guides/track/limits/
+            wandb.log({f"embeddings/val": table, "epoch": int(epoch)})
+
+
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         
@@ -158,7 +305,16 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 'val_acc': val_acc,
                 "train/loss_cls": loss_cls.item(),
                 "train/loss_rec": loss_rec.item(),
+                "val/loss_cls": b_loss_cls.item(),
+                "val/loss_rec": b_loss_rec.item(),
             }
+
+            # 🌟 [수정] 생성된 이미지가 있으면 log_dict에 추가
+            if reconstruction_image_to_log:
+                log_dict['train/reconstruction_comparison'] = reconstruction_image_to_log
+            if val_reconstruction_image_to_log:
+                log_dict['val/reconstruction_comparison'] = val_reconstruction_image_to_log
+            
             # 🔹 sklearn PRF 추가 (있을 때만)
             if train_metrics is not None:
                 log_dict.update({
@@ -287,23 +443,6 @@ def train_with_config(rank, world_size, args):
     
     # 데이터 준비
     data_root = os.path.join(os.getcwd(), config.data_root)
-    meta_csv = os.path.join(data_root, 'meta.csv')
-    meta_pd = pd.read_csv(meta_csv)
-    
-    meta_pd['sensor_position'] = meta_pd['sensor_position'].apply(ast.literal_eval)
-    meta_pd = meta_pd[5 <= meta_pd['data_sec']]
-    
-    # 학습용 데이터셋과 검증용 데이터셋 분리
-    train_meta = meta_pd[meta_pd['dataset'] != 'dxai'].copy()
-    val_meta = meta_pd[meta_pd['dataset'] == 'dxai'].copy()
-    
-    if rank == 0:  # 메인 프로세스에서만 출력
-        print(f"\nTraining samples (non-IIS): {len(train_meta)}")
-        print(f"Validation samples (IIS): {len(val_meta)}")
-        print("\nTraining dataset distribution:")
-        print(train_meta['dataset'].value_counts())
-        print("\nValidation dataset distribution:")
-        print(val_meta['dataset'].value_counts())
     
     # 이미지 변환기 설정 (pretrained 모델 사용 시 224x224로 강제)
     output_size = 224 if config.pretrained else config.image_size
@@ -325,16 +464,12 @@ def train_with_config(rank, world_size, args):
         stft_window="hann",
         stft_center=True,
         stft_power=config.stft_power,
-        # CWT
-        cwt_wavelet="morl",
-        cwt_num_scales=64,
-        cwt_scale_base=2.0,
     )
     
     # 학습용 데이터셋 생성
     train_dataset = WindowedVibrationDataset(
-        meta_df=train_meta,
         data_root=data_root,
+        using_dataset = ['iis', 'vat', 'vbl', 'mfd'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',
@@ -343,8 +478,8 @@ def train_with_config(rank, world_size, args):
     
     # 검증용 데이터셋 생성
     val_dataset = WindowedVibrationDataset(
-        meta_df=val_meta,
         data_root=data_root,
+        using_dataset = ['dxai'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',
@@ -409,7 +544,8 @@ def train_with_config(rank, world_size, args):
         optimizer=optimizer,
         num_epochs=config.epochs,
         device=device,
-        rank=rank
+        rank=rank,
+        config=config
     )
     
     cleanup()  # process group destroy
@@ -462,7 +598,7 @@ def parse_args():
                         help='Path to the processed data directory')
     parser.add_argument('--sweep_config', type=str, default=None,
                         help='Path to wandb sweep configuration file')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--image_size', type=int, default=256)

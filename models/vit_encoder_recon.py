@@ -105,6 +105,134 @@ class MAEDecoder(nn.Module):
         pred = self.pred(z_)
         return pred  # (N, L, p*p*C)
 
+#####
+# 위는 transformer 기반
+# 아래는 cnn 기반
+#####
+
+class ResBlock(nn.Module):
+    def __init__(self, ch: int, hidden: int = None, norm: bool = True):
+        super().__init__()
+        hidden = hidden or ch
+        self.block = nn.Sequential(
+            nn.Conv2d(ch, hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden) if norm else nn.Identity(),
+            nn.GELU(),
+            nn.Conv2d(hidden, ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(ch) if norm else nn.Identity(),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x):
+        return self.act(x + self.block(x))
+
+
+class CNNPatchDecoder(nn.Module):
+    """
+    옵션 B: Conv + PixelShuffle 기반 패치 디코더.
+    - 입력: z_vis (N, L_vis, encoder_dim), ids_restore (N, L)
+    - 출력: pred_tokens (N, L, p*p*C)
+    - 동작: 토큰 복원(마스크 채움 → 원래 순서로 정렬) → (h,w) 2D 토큰그리드 →
+            1x1 Conv로 channel 정렬 → ResBlock 스택 → Conv(채널=C*p^2) →
+            PixelShuffle(p)로 (N,C,H,W) 복원 → patchify로 (N,L,p*p*C)
+    """
+    def __init__(
+        self,
+        encoder_dim: int,
+        decoder_dim: int,
+        num_layers: int,          # CNN 깊이로 활용 (ResBlock 개수)
+        num_heads: int,           # 시그니처 호환용(미사용)
+        num_patches: int,
+        patch_dim: int,
+        image_size: int,
+        patch_size: int,
+        out_channels: int = 4,
+        base_ch: int = 256,
+        use_norm: bool = True,
+    ):
+        super().__init__()
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        self.patch_dim = patch_dim  # = out_channels * (patch_size ** 2)
+
+        # 토큰 그리드 크기
+        h = image_size // patch_size
+        w = image_size // patch_size
+        assert h * w == num_patches, "num_patches != (H/p)*(W/p)"
+        self.h, self.w = h, w
+
+        # 1) 토큰 차원 정렬 및 마스크 토큰
+        self.token_proj = nn.Linear(encoder_dim, decoder_dim)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+        nn.init.trunc_normal_(self.mask_token, std=0.02)
+
+        # 2) 2D feature화
+        self.conv_in = nn.Conv2d(decoder_dim, base_ch, kernel_size=1)
+
+        # 3) CNN 본체(ResBlock * num_layers)
+        blocks = []
+        depth = max(1, num_layers)
+        for _ in range(depth):
+            blocks.append(ResBlock(base_ch, hidden=base_ch * 2, norm=use_norm))
+        self.body = nn.Sequential(*blocks)
+
+        # 4) 출력부: 중간 conv → PixelShuffle(patch_size)
+        self.conv_mid = nn.Sequential(
+            nn.Conv2d(base_ch, base_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(base_ch) if use_norm else nn.Identity(),
+            nn.GELU(),
+        )
+        self.conv_out = nn.Conv2d(base_ch, out_channels * (patch_size ** 2), kernel_size=1)
+        self.shuffle = nn.PixelShuffle(patch_size)
+
+        # 간단 초기화
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+                if getattr(m, "bias", None) is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, z_vis: torch.Tensor, ids_restore: torch.Tensor) -> torch.Tensor:
+        """
+        z_vis: (N, L_vis, encoder_dim)
+        ids_restore: (N, L)  # 원래 패치 순서 복원용 인덱스
+        return: pred_tokens (N, L, p*p*C)
+        """
+        N, L = ids_restore.shape
+        # (1) 임베딩 정렬
+        z_vis = self.token_proj(z_vis)           # (N, L_vis, dec_dim)
+        dec_dim = z_vis.shape[-1]
+
+        # (2) 마스크 토큰으로 전체 L 재구성
+        L_vis = z_vis.shape[1]
+        L_mask = L - L_vis
+        if L_mask > 0:
+            mask_tokens = self.mask_token.expand(N, L_mask, dec_dim)  # (N, L_mask, dec_dim)
+            z_full = torch.cat([z_vis, mask_tokens], dim=1)           # (N, L, dec_dim) in shuffled order
+        else:
+            z_full = z_vis
+
+        # (3) 원래 순서로 unshuffle
+        z_full = torch.gather(z_full, 1, ids_restore.unsqueeze(-1).expand(-1, -1, dec_dim))  # (N, L, dec_dim)
+
+        # (4) 2D 토큰 그리드화: (N, L, D) → (N, D, h, w)
+        x = z_full.view(N, self.h, self.w, dec_dim).permute(0, 3, 1, 2).contiguous()
+
+        # (5) CNN 처리
+        x = self.conv_in(x)     # (N, base_ch, h, w)
+        x = self.body(x)        # (N, base_ch, h, w)
+        x = self.conv_mid(x)    # (N, base_ch, h, w)
+
+        # (6) PixelShuffle로 원해상도 이미지 복원
+        x = self.conv_out(x)    # (N, C*p^2, h, w)
+        img = self.shuffle(x)   # (N, C, H, W), H=h*p, W=w*p
+
+        # (7) 다시 (N, L, p*p*C) 토큰화
+        pred_tokens = patchify(img, self.patch_size)
+        return pred_tokens
+
+
 class VITEnClassify(nn.Module):
     """
     4개의 단일 채널 이미지를 입력으로 받아 분류를 수행하는 Vision Transformer 모델.
@@ -165,9 +293,22 @@ class VITEnClassify(nn.Module):
         # 4) 복원 디코더 구성(MAE 스타일)
         num_patches = (self.image_size // self.patch_size) ** 2
         patch_dim = self.patch_size * self.patch_size * 4
-        self.decoder = MAEDecoder(
-            encoder_dim=enc_dim, decoder_dim=dec_dim, num_layers=dec_layers, num_heads=dec_heads,
-            num_patches=num_patches, patch_dim=patch_dim, image_size=self.image_size, patch_size=self.patch_size
+        # self.decoder = MAEDecoder(
+        #     encoder_dim=enc_dim, decoder_dim=dec_dim, num_layers=dec_layers, num_heads=dec_heads,
+        #     num_patches=num_patches, patch_dim=patch_dim, image_size=self.image_size, patch_size=self.patch_size
+        # )
+        self.decoder = CNNPatchDecoder(
+            encoder_dim=enc_dim,
+            decoder_dim=dec_dim,
+            num_layers=dec_layers,
+            num_heads=dec_heads,          # 미사용(호환용)
+            num_patches=num_patches,
+            patch_dim=patch_dim,
+            image_size=self.image_size,
+            patch_size=self.patch_size,
+            out_channels=4,
+            base_ch=256,
+            use_norm=True,
         )
 
         # 디버깅용
@@ -226,7 +367,7 @@ class VITEnClassify(nn.Module):
     # ---------------------------
     # forward: 공동학습용 출력
     # ---------------------------
-    def forward(self, x):
+    def forward(self, x, return_feats: bool = False):
         """
         반환:
           logits: (N, num_classes)
@@ -235,15 +376,20 @@ class VITEnClassify(nn.Module):
         """
         # 1) 분류 경로(전체 토큰)
         z_full = self._encode_full(x)             # (N, 1+L, D)
-        logits = self.vit.heads(z_full[:, 0, :])  # cls -> head
+        cls_feat = z_full[:, 0, :]              # (N, D)
+        logits = self.vit.heads(cls_feat)  # cls -> head
 
         # 2) 복원 경로(마스크 토큰/디코더)
         z_vis, ids_restore, ids_keep = self._encode_masked(x)        # (N, L_vis, D), (N, L)
         rec_tokens = self.decoder(z_vis, ids_restore)       # (N, L, patch_dim)
         rec_img = unpatchify(rec_tokens, 4, self.image_size, self.patch_size)  # (N, C, H, W)
 
-        return logits, rec_img, {"ids_restore": ids_restore, "ids_keep": ids_keep,
-                         "mask_ratio": self.mask_ratio, "rec_tokens": rec_tokens}
+        aux = {"ids_restore": ids_restore, "ids_keep": ids_keep,
+            "mask_ratio": self.mask_ratio, "rec_tokens": rec_tokens}
+        if return_feats:
+            return logits, rec_img, aux, cls_feat
+        else:
+            return logits, rec_img, aux
 
 # --- 코드 사용 예시 ---
 if __name__ == '__main__':
