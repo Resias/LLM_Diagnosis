@@ -611,7 +611,7 @@ def parse_args():
                         help='Path to the processed data directory')
     parser.add_argument('--sweep_config', type=str, default=None,
                         help='Path to wandb sweep configuration file')
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--image_size', type=int, default=256)
