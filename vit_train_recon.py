@@ -65,7 +65,11 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         reconstruction_image_to_log = None
         
         # dataset에서 getitem에 인자 true로 설정해놓으면 아래와 같이 info도 같이 줌
-        for i, (inputs, labels, info) in enumerate(train_iter):
+        for i, batch in enumerate(train_iter):
+            if len(batch) == 3:
+                inputs, labels, info = batch
+            else:
+                inputs, labels, info, inputs_n, labels_n, info_n = batch
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
@@ -187,7 +191,11 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         val_reconstruction_image_to_log = None
 
         with torch.no_grad():
-            for i, (inputs, labels, info) in enumerate(val_loader):
+            for i, batch  in enumerate(val_loader):
+                if len(batch) == 3:
+                    inputs, labels, info = batch
+                else:
+                    inputs, labels, info, inputs_n, labels_n, info_n = batch
                 inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 logits, rec_img, aux, cls_feat = model(inputs, return_feats=True)
                 b_loss_cls = criterion(logits, labels)
@@ -211,7 +219,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
 
                 bs = labels.size(0)
-                val_loss_sum_local += loss.item() * bs
+                val_loss_sum_local += b_loss.item() * bs
                 _, pred = logits.max(1)
                 val_correct_local += (pred == labels).sum().item()
                 val_total_local += bs

@@ -236,12 +236,12 @@ class WindowedVibrationDataset(Dataset):
         info = {
             "sampling_rate": float(sr),
             "rpm": float(row["rpm"]),
-            "label_class": row["class_name"],
-            "merged_class": row["merged_class"],
-            "severity": row["severity"],
-            "load_condition": row["load_condition"],
-            "dataset": row["dataset"],
-            "file_name": row["file_name"],
+            "label_class": str(row["class_name"]),
+            "merged_class": str(row["merged_class"]),
+            "severity": str(row["severity"]),
+            "load_condition": str(row["load_condition"]),
+            "dataset": str(row["dataset"]),
+            "file_name": str(row["file_name"]),
         }
 
         # ---- normal reference (same dataset & load_condition) ----
