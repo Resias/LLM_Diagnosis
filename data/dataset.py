@@ -137,7 +137,7 @@ class WindowedVibrationDataset(Dataset):
     def __len__(self):
         return len(self.index_map)
 
-    def __getitem__(self, idx, return_info=False):
+    def __getitem__(self, idx, return_info=True):
         row_idx, start = self.index_map[idx]
         row = self.meta_df.iloc[row_idx]
         meta = self._row_meta[row_idx]
@@ -165,12 +165,12 @@ class WindowedVibrationDataset(Dataset):
             seg = win[widx]  # (2, win_n)
 
         info = {
-            "sampling_rate": sr,
+            "sampling_rate": int(sr),
             "rpm": float(row["rpm"]),
-            "label_class": row["class_name"],
-            "severity": row["severity"],
-            "load_condition": row["load_condition"],
-            "dataset": row["dataset"]
+            "label_class": str(row["class_name"]),
+            "severity": str(row["severity"]),
+            "load_condition": str(row["load_condition"]),
+            "dataset": str(row["dataset"])
         }
         
         tensor_img = self.transform(seg, sr=sr, rpm=float(row["rpm"]))

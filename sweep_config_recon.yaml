@@ -8,6 +8,8 @@ parameters:
     min: 0.0001
     max: 0.001
     distribution: log_uniform_values
+  epochs:
+    value: 200
   stft_power:
     values: [1.0, 2.0]
   model_size:
