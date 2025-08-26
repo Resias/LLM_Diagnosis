@@ -435,23 +435,6 @@ def train_with_config(rank, world_size, args):
     
     # 데이터 준비
     data_root = os.path.join(os.getcwd(), config.data_root)
-    meta_csv = os.path.join(data_root, 'meta.csv')
-    meta_pd = pd.read_csv(meta_csv)
-    
-    meta_pd['sensor_position'] = meta_pd['sensor_position'].apply(ast.literal_eval)
-    meta_pd = meta_pd[5 <= meta_pd['data_sec']]
-    
-    # 학습용 데이터셋과 검증용 데이터셋 분리
-    train_meta = meta_pd[meta_pd['dataset'] != 'dxai'].copy()
-    val_meta = meta_pd[meta_pd['dataset'] == 'dxai'].copy()
-    
-    if rank == 0:  # 메인 프로세스에서만 출력
-        print(f"\nTraining samples (non-IIS): {len(train_meta)}")
-        print(f"Validation samples (IIS): {len(val_meta)}")
-        print("\nTraining dataset distribution:")
-        print(train_meta['dataset'].value_counts())
-        print("\nValidation dataset distribution:")
-        print(val_meta['dataset'].value_counts())
     
     # 이미지 변환기 설정 (pretrained 모델 사용 시 224x224로 강제)
     output_size = 224 if config.pretrained else config.image_size
@@ -473,16 +456,12 @@ def train_with_config(rank, world_size, args):
         stft_window="hann",
         stft_center=True,
         stft_power=config.stft_power,
-        # CWT
-        cwt_wavelet="morl",
-        cwt_num_scales=64,
-        cwt_scale_base=2.0,
     )
     
     # 학습용 데이터셋 생성
     train_dataset = WindowedVibrationDataset(
-        meta_df=train_meta,
         data_root=data_root,
+        using_dataset = ['iis', 'vat', 'vbl', 'mfd'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',
@@ -491,8 +470,8 @@ def train_with_config(rank, world_size, args):
     
     # 검증용 데이터셋 생성
     val_dataset = WindowedVibrationDataset(
-        meta_df=val_meta,
         data_root=data_root,
+        using_dataset = ['dxai'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',
