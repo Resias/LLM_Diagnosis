@@ -60,8 +60,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         total_local    = 0.0
         train_preds_local = []
         train_labels_local = []
-        
         embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch = [], [], [], []
+        embeds_diff_epoch = []
         reconstruction_image_to_log = None
         
         # dataset에서 getitem에 인자 true로 설정해놓으면 아래와 같이 info도 같이 줌
@@ -73,7 +73,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            logits, rec_img, aux, cls_feat = model(inputs, return_feats=True)
+            logits, rec_img, aux, cls_feat, diff_feat = model(inputs, inputs_n, return_feats=True)
             loss_cls = criterion(logits, labels)
             loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
 
@@ -104,7 +104,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             train_preds_local.append(pred.detach())
             train_labels_local.append(labels.detach())
 
-            embeds_epoch.append(cls_feat.detach().cpu())    # (B, D)
+            embeds_epoch.append(cls_feat.detach().cpu())     # (B, D)
+            embeds_diff_epoch.append(diff_feat.detach().cpu())  # (B, D)
             y_true_epoch.append(labels.detach().cpu())
             y_pred_epoch.append(pred.detach().cpu())
             ds_epoch.extend(list(info["dataset"]))
@@ -138,6 +139,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
         # (3) 배치들 concat
         embeds_epoch = torch.cat(embeds_epoch, dim=0)    # (M, D)
+        embeds_diff_epoch = torch.cat(embeds_diff_epoch, dim=0)    # (M, D)
         y_true_epoch = torch.cat(y_true_epoch, dim=0)    # (M,)
         y_pred_epoch = torch.cat(y_pred_epoch, dim=0)    # (M,)
         ds_epoch = np.array(ds_epoch)                    # (M,)
@@ -149,13 +151,14 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         if M > max_points:
             idx = torch.randperm(M)[:max_points]
             embeds_s = embeds_epoch[idx]
+            embeds_diff = embeds_diff_epoch[idx]
             ytrue_s = y_true_epoch[idx]
             ypred_s = y_pred_epoch[idx]
             # 리스트는 인덱싱으로 맞춰 재배치
             idx_np = idx.cpu().numpy().tolist()
-            ds_s    = [ds_epoch[i] for i in idx_np]
+            ds_s = [ds_epoch[i] for i in idx_np]
         else:
-            embeds_s, ytrue_s, ypred_s, ds_s = embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch
+            embeds_s, embeds_diff, ytrue_s, ypred_s, ds_s = embeds_epoch, embeds_diff_epoch, y_true_epoch, y_pred_epoch, ds_epoch
 
         if rank == 0 and wandb.run is not None:
             # W&B Table (M rows)
@@ -178,6 +181,24 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
             # https://docs.wandb.ai/guides/track/limits/
             wandb.log({f"embeddings/train": table, "epoch": int(epoch)})
+            
+            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+
+            E = embeds_diff.cpu().numpy().tolist()
+            P = ypred_s.cpu().numpy().tolist()
+            Y = ytrue_s.cpu().numpy().tolist()
+
+            for i in range(len(E)):
+                table.add_data(
+                    E[i],
+                    int(P[i]),
+                    int(Y[i]),
+                    ds_s[i],
+                    "train_diff",
+                    int(epoch))
+            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+            # https://docs.wandb.ai/guides/track/limits/
+            wandb.log({f"embeddings/train_diff": table, "epoch": int(epoch)})
 
         # Validation phase
         model.eval()
@@ -188,6 +209,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         val_labels_local = []
 
         embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch = [], [], [], []
+        embeds_diff_epoch = []
         val_reconstruction_image_to_log = None
 
         with torch.no_grad():
@@ -197,7 +219,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 else:
                     inputs, labels, info, inputs_n, labels_n, info_n = batch
                 inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                logits, rec_img, aux, cls_feat = model(inputs, return_feats=True)
+                logits, rec_img, aux, cls_feat, diff_feat = model(inputs, inputs_n, return_feats=True)
                 b_loss_cls = criterion(logits, labels)
                 b_loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
                 
@@ -217,7 +239,6 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                     val_reconstruction_image_to_log = wandb.Image(fig)
                     plt.close(fig)
 
-
                 bs = labels.size(0)
                 val_loss_sum_local += b_loss.item() * bs
                 _, pred = logits.max(1)
@@ -227,6 +248,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 val_labels_local.append(labels.detach())
                 
                 embeds_epoch.append(cls_feat.detach().cpu())    # (B, D)
+                embeds_diff_epoch.append(diff_feat.detach().cpu())    # (B, D)
                 y_true_epoch.append(labels.detach().cpu())
                 y_pred_epoch.append(pred.detach().cpu())
                 ds_epoch.extend(list(info["dataset"]))
@@ -250,6 +272,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
         # (3) 배치들 concat
         embeds_epoch = torch.cat(embeds_epoch, dim=0)    # (M, D)
+        embeds_diff_epoch = torch.cat(embeds_diff_epoch, dim=0)    # (M, D)
         y_true_epoch = torch.cat(y_true_epoch, dim=0)    # (M,)
         y_pred_epoch = torch.cat(y_pred_epoch, dim=0)    # (M,)
         ds_epoch = np.array(ds_epoch)                    # (M,)
@@ -261,13 +284,14 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         if M > max_points:
             idx = torch.randperm(M)[:max_points]
             embeds_s = embeds_epoch[idx]
+            embeds_diff = embeds_diff_epoch[idx]
             ytrue_s = y_true_epoch[idx]
             ypred_s = y_pred_epoch[idx]
             # 리스트는 인덱싱으로 맞춰 재배치
             idx_np = idx.cpu().numpy().tolist()
             ds_s    = [ds_epoch[i] for i in idx_np]
         else:
-            embeds_s, ytrue_s, ypred_s, ds_s = embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch
+            embeds_s, embeds_diff, ytrue_s, ypred_s, ds_s = embeds_epoch, embeds_diff_epoch, y_true_epoch, y_pred_epoch, ds_epoch
 
         if rank == 0 and wandb.run is not None:
             # W&B Table (M rows)
@@ -290,6 +314,24 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
             # https://docs.wandb.ai/guides/track/limits/
             wandb.log({f"embeddings/val": table, "epoch": int(epoch)})
+            
+            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+
+            E = embeds_diff.cpu().numpy().tolist()
+            P = ypred_s.cpu().numpy().tolist()
+            Y = ytrue_s.cpu().numpy().tolist()
+
+            for i in range(len(E)):
+                table.add_data(
+                    E[i],
+                    int(P[i]),
+                    int(Y[i]),
+                    ds_s[i],
+                    "val_diff",
+                    int(epoch))
+            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+            # https://docs.wandb.ai/guides/track/limits/
+            wandb.log({f"embeddings/val_diff": table, "epoch": int(epoch)})
 
 
         if dist.is_available() and dist.is_initialized():
