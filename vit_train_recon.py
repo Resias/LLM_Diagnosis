@@ -40,8 +40,17 @@ def _ddp_sum_tensor(t):
 def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank, config):
     best_val_acc = 0.0
     is_main_process = rank == 0  # 메인 프로세스 여부 확인
+    warmup_epochs = getattr(config, "warmup_epochs", 0)   # 새 인자 사용
     
     for epoch in range(num_epochs):
+        # --- (핵심) 에폭별 α 결정: 워밍업 구간에서는 분류 손실 비중 0 ---
+        if epoch < warmup_epochs:
+            effective_alpha = 0.0
+            phase_name = "warmup"
+        else:
+            effective_alpha = float(alpha)
+            phase_name = "finetune"
+        
         # sampler의 epoch 설정
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
@@ -77,7 +86,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             loss_cls = criterion(logits, labels)
             loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
 
-            loss = alpha * loss_cls + (1 - alpha) * loss_rec
+            loss = effective_alpha * loss_cls + (1 - effective_alpha) * loss_rec
             loss.backward()
             optimizer.step()
 
@@ -223,7 +232,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 b_loss_cls = criterion(logits, labels)
                 b_loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
                 
-                b_loss = alpha * b_loss_cls + (1 - alpha) * b_loss_rec
+                b_loss = effective_alpha * b_loss_cls + (1 - effective_alpha) * b_loss_rec
 
                 # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
                 if is_main_process and i == 0 and wandb.run is not None:
@@ -640,7 +649,7 @@ def parse_args():
                         help='Path to the processed data directory')
     parser.add_argument('--sweep_config', type=str, default=None,
                         help='Path to wandb sweep configuration file')
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--image_size', type=int, default=256)
@@ -664,6 +673,9 @@ def parse_args():
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
                         help='Port for distributed training')
+    parser.add_argument('--warmup_epochs', type=int, default=100,
+                        help='epochs for reconstruction-only warm-up (classification weight=0)')
+
 
     return parser.parse_args()
 
