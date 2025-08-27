@@ -367,17 +367,24 @@ class VITEnClassify(nn.Module):
     # ---------------------------
     # forward: 공동학습용 출력
     # ---------------------------
-    def forward(self, x, return_feats: bool = False):
+    def forward(self, x, normal = None, return_feats: bool = False):
         """
         반환:
           logits: (N, num_classes)
           rec_pred: (N, C, H, W)         # 복원 이미지
           aux: dict(ids_restore, rec_tokens, mask_ratio)
         """
+
         # 1) 분류 경로(전체 토큰)
         z_full = self._encode_full(x)             # (N, 1+L, D)
         cls_feat = z_full[:, 0, :]              # (N, D)
-        logits = self.vit.heads(cls_feat)  # cls -> head
+        if normal is None:
+            logits = self.vit.heads(cls_feat)  # cls -> head
+        else:
+            z_normal = self._encode_full(normal)
+            cls_feat_normal = z_normal[:, 0, :]
+            diff = cls_feat - cls_feat_normal
+            logits = self.vit.heads(diff)
 
         # 2) 복원 경로(마스크 토큰/디코더)
         z_vis, ids_restore, ids_keep = self._encode_masked(x)        # (N, L_vis, D), (N, L)
@@ -387,7 +394,10 @@ class VITEnClassify(nn.Module):
         aux = {"ids_restore": ids_restore, "ids_keep": ids_keep,
             "mask_ratio": self.mask_ratio, "rec_tokens": rec_tokens}
         if return_feats:
-            return logits, rec_img, aux, cls_feat
+            if normal is None:
+                return logits, rec_img, aux, cls_feat
+            else:
+                return logits, rec_img, aux, cls_feat, diff
         else:
             return logits, rec_img, aux
 
@@ -410,17 +420,20 @@ if __name__ == '__main__':
     # 더미(dummy) 입력 데이터 생성
     # 4개의 (B, 4, H, W) 형태의 텐서를 생성
     dummy_img = torch.randn(BATCH_SIZE, 4, IMAGE_SIZE, IMAGE_SIZE)
+    dummy_normal = torch.randn(BATCH_SIZE, 4, IMAGE_SIZE, IMAGE_SIZE)
 
     # 모델의 forward pass 실행
-    output_logits = model(dummy_img)
+    outputs = model(dummy_img, dummy_normal)
 
     # ====== 핵심 수정: 언팩 ======
-    logits, rec_img, aux = model(dummy_img)
+    logits, rec_img, aux, feats, diff_feat = model(dummy_img, dummy_normal, return_feats=True)
 
     # 출력 형태 확인
-    print(f"\nInput shape: {tuple(dummy_img.shape)}")            # (8, 4, 256, 256)
-    print(f"Logits shape: {tuple(logits.shape)}")               # (8, 5)
-    print(f"Reconstruction shape: {tuple(rec_img.shape)}")      # (8, 4, 256, 256)
+    print(f"\nInput shape: {tuple(dummy_img.shape)}")          # (8, 4, 256, 256)
+    print(f"Logits shape: {tuple(logits.shape)}")              # (8, 5)
+    print(f"Reconstruction shape: {tuple(rec_img.shape)}")     # (8, 4, 256, 256)
+    print(f"Feature shape: {tuple(feats.shape)}")              # (8, 4, 256, 256)
+    print(f"Diff feature shape: {tuple(diff_feat.shape)}")     # (8, 4, 256, 256)
 
     # 보조 정보
     ids_restore = aux["ids_restore"]     # (N, L)
