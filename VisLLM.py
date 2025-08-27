@@ -4,6 +4,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from trl import GRPOConfig
 from peft import get_peft_model, LoraConfig, TaskType
 
+from models.vit_encoder_recon import VITEnClassify
 from VisLLM.vib_grpo import CustomGRPOTRainer, reward_accuracy, reward_format
 from VisLLM.vllm_dataset import make_retreiver, Planner, VibrationTokenizer, VibrationSFTDataset
 from data.dataset import OrderInvariantSignalImager, WindowedVibrationDataset
@@ -15,11 +16,12 @@ if __name__ == '__main__':
     
     parser.add_argument('--llm_model',      type=str, default='Qwen/Qwen3-4B-Instruct-2507', help='LLM Model name')
     parser.add_argument('--embedding_model',type=str, default='Qwen/Qwen3-embedding-0.6B', help='Embedding Model name for RAG')
-    parser.add_argument('--palnner_max_token', type=int, default=4000, help='Max new tokens for main generation (trainer)')
+    parser.add_argument('--planner_max_token', type=int, default=4000, help='Max new tokens for main generation (trainer)')
     args = parser.parse_args()
     
     
     # Tokenizner & LLM & RAG (+special token/LoRA setting)
+    print('Loading Tokenizer, LLM ...')
     tokenizer = AutoTokenizer.from_pretrained(args.llm_model,
                                             cache_dir=args.model_cache)
     
@@ -39,13 +41,17 @@ if __name__ == '__main__':
     tokenizer.add_special_tokens(special_tokens)
     llm.resize_token_embeddings(len(tokenizer))
     
-    vib_encoder = None # 승하가 구현중
+    vib_encoder = VITEnClassify(
+        num_classes=5
+    )
     token_embed_dim = int(llm.get_input_embeddings().embedding_dim)
+    
     vib_tokenizer = VibrationTokenizer(
         vib_encoder=vib_encoder,
-        token_embed_dim=int(llm.get_input_embeddings().embedding_dim),
+        token_embed_dim=token_embed_dim,
         freeze_encoder=False
     )
+    print('Setting RAG ... ')
     retriever = make_retreiver(
         embedding_model=args.embedding_model,
         model_cache=args.model_cache,
@@ -55,6 +61,7 @@ if __name__ == '__main__':
     
     
     # Planer
+    print('Setting Planner ... ')
     planner = Planner(tokenizer=tokenizer,
                         llm=llm,
                         retreiver=retriever,
@@ -62,6 +69,7 @@ if __name__ == '__main__':
     
     
     # Dataset
+    print('Building Dataset ... ')
     data_root = args.dataset_root
     data_mode = 'stft+cross'
     signal_imger = OrderInvariantSignalImager(
@@ -110,6 +118,7 @@ if __name__ == '__main__':
     )
     
     # Training
+    print('Start Training!')
     training_args = GRPOConfig(
         output_dir=args.model_out,
         logging_strategy="steps",

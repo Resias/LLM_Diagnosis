@@ -6,7 +6,7 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import argparse
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
 
@@ -81,7 +81,7 @@ class Planner:
         return plan_summerize
 
 class VibrationTokenizer(nn.Module):
-    def __init__(self, vib_encoder, token_embed_dim, freeze_encoder=True):
+    def __init__(self, vib_encoder, token_embed_dim, freeze_encoder=True, embedding_dim=256):
         super().__init__()
         self.vib_encoder = vib_encoder
 
@@ -89,11 +89,15 @@ class VibrationTokenizer(nn.Module):
             for param in self.vib_encoder.parameters():
                 param.requires_grad = False
 
-        in_dim = int(self.vib_encoder.embed_dim)
         self.model = nn.Sequential(
             nn.Flatten(),
             nn.Linear(
-                in_features=in_dim,
+                in_features=embedding_dim,
+                out_features=int(embedding_dim*2)
+            ),
+            nn.Sigmoid(),
+            nn.Linear(
+                in_features=int(embedding_dim*2),
                 out_features=token_embed_dim
             )
         )
@@ -102,7 +106,12 @@ class VibrationTokenizer(nn.Module):
         current_tensor = current_x.unsqueeze(0)
         normal_tensor = normal_x.unsqueeze(0)
         
-        sample_attn, normal_attn, attension_dict = self.vib_encoder(current_tensor, normal_tensor, get_z=True)
+        sample_attn = self.vib_encoder._encode_full(current_tensor)
+        sample_attn = sample_attn[:, 0, :] # 768
+        
+        normal_attn = self.vib_encoder._encode_full(normal_tensor)
+        normal_attn = normal_attn[:, 0, :] # 768
+        
         current_z = self.model(sample_attn)
         normal_z = self.model(normal_attn)
         return current_z, normal_z
