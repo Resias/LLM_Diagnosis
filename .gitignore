@@ -12,3 +12,7 @@ results/
 checkpoints/*.pth
 wandb/
 checkpoints/*.pth
+cmd
+docs_eng/
+model_cache/
+*/__pycache__/
