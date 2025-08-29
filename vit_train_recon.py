@@ -540,7 +540,7 @@ def train_with_config(rank, world_size, args):
     # 학습용 데이터셋 생성
     train_dataset = WindowedVibrationDataset(
         data_root=data_root,
-        using_dataset = ['iis', 'vat', 'vbl', 'mfd'],
+        using_dataset = ['vat', 'vbl', 'mfd'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',
