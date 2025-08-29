@@ -4,11 +4,14 @@ import torch
 from accelerate.utils import gather_object
 from trl.data_utils import maybe_apply_chat_template
 import re
+import copy
+import json
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from contextlib import nullcontext
 from trl.models import unwrap_model_for_generation
 from html import escape
 import wandb
+
 
 # torch.nanstd doesn't exist, so we define it here
 def nanstd(tensor: torch.Tensor) -> torch.Tensor:
@@ -29,44 +32,86 @@ def nanstd(tensor: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(variance)
 
 class CustomGRPOTRainer(GRPOTrainer):
+    def __init__(
+        self,
+        model,
+        reward_funcs,
+        args=None,
+        train_dataset=None,
+        eval_dataset=None,
+        processing_class=None,
+        reward_processing_classes=None,
+        callbacks=None,
+        optimizers=(None, None),
+        peft_config=None,
+        vib_tokenizer=None,   # 진동 토크나이저(Custom)
+    ):
+        # 부모 초기화 그대로
+        super().__init__(
+            model=model,
+            reward_funcs=reward_funcs,
+            args=args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=processing_class,
+            reward_processing_classes=reward_processing_classes,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            peft_config=peft_config,
+        )
+        # 내가 추가한 것만 저장
+        self.vib_tokenizer = vib_tokenizer
+        
     """
     GRPO에 custom multi-modal 기능이 없어 구현
     """
+
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
         
-        # print(inputs[0]['prompt'])
-        # for data_sample in inputs:
-        #     print(data_sample['prompt'])
-        
         prompts = [x["prompt"] for x in inputs]
-        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        
+        # We don't yet support visual reward models/function, so we keep a copy of the original text-only prompts for
+        # later use in the reward computation. If images are present, we insert {"type": "image"} as required by the
+        # VLM chat template.
+        original_prompts = copy.deepcopy(prompts)
+        
+        # If the prompts are conversational and the inputs contain images, we need to convert the prompts from
+        # [{"role": "user", "content": "What color is the sky?"}] to
+        # [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "What color is the sky?"}]}]
+        kwargs = {}
+        has_images = "image" in inputs[0]
+        if has_images:
+            images = [example.get("image") for example in inputs]
+            kwargs = {"images": [[img] for img in images]}
+            for prompt in prompts:
+                if isinstance(prompt, list):
+                    for message in prompt:
+                        if not isinstance(message, dict):
+                            continue
+                        content = message.get("content")
+                        role = message.get("role")
+                        if isinstance(content, str):
+                            if role == "user":
+                                message["content"] = [{"type": "image"}, {"type": "text", "text": content}]
+                            elif role == "system":
+                                message["content"] = [{"type": "text", "text": content}]
 
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left"
         )
-        # prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
         
+        # 스페셜 토큰의 위치를 찾아 저장한다. (Custom)
         normal_id = self.processing_class.convert_tokens_to_ids("<NORMAL_VIB_EMB>")
         current_id = self.processing_class.convert_tokens_to_ids("<CURRENT_VIB_EMB>")
         
-        
-        if self.max_prompt_length is not None:
-            # If max_prompt_length is set, we trim the prompt to keep only the last `max_prompt_length` tokens.
-            # Then we decode those tokens back into text. We manually remove leading pad tokens from the decoded text,
-            # because we can't use `skip_special_tokens=True` (some special tokens are still needed for generation).
-            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
-            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
-            prompts_text = self.processing_class.batch_decode(
-                prompt_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False
-            )
-            prompts_text = [
-                re.sub(rf"^({re.escape(self.processing_class.pad_token)})+", "", text) for text in prompts_text
-            ]
 
         # Regular generation path
         with (
@@ -82,41 +127,46 @@ class CustomGRPOTRainer(GRPOTrainer):
             input_embeddings = self.model.get_input_embeddings()(prompt_ids.clone())
             prompt_mask = prompt_mask.to(self.model.device)
 
+            # 진동 토큰 주입 파트(Custom)
             for i in range(len(inputs)):
-                n_pos = (prompt_ids[i] == normal_id).nonzero(as_tuple=False)
-                c_pos = (prompt_ids[i] == current_id).nonzero(as_tuple=False)
- 
-                input_embeddings[i, n_pos.item()] = inputs[i]['normal_token'].to(input_embeddings.device)
-                input_embeddings[i, c_pos.item()] = inputs[i]['currnet_token'].to(input_embeddings.device)
+                # Find positions of placeholder tokens in the tokenized prompt
+                # Use as_tuple=True to get a 1D index tensor and handle 0/1/Many occurrences robustly.
+                n_pos = (prompt_ids[i] == normal_id).nonzero(as_tuple=True)[0]
+                c_pos = (prompt_ids[i] == current_id).nonzero(as_tuple=True)[0]
 
-            
+                # If placeholders are missing (e.g., due to truncation), skip replacement to avoid crashes.
+                if n_pos.numel() == 0 or c_pos.numel() == 0:
+                    assert f"[warn] Placeholder token(s) not found in sample {i}. "
+                    exit()
+
+                # Assign the same learned vibration embedding to all matching positions
+                # Ensure dtype/device match the model input embeddings
+                normal_x = inputs[i]['normal_x'].to(device=self.vib_tokenizer.device, dtype=self.vib_tokenizer.dtype)
+                current_x = inputs[i]['current_x'].to(device=self.vib_tokenizer.device, dtype=self.vib_tokenizer.dtype)
+                
+                n_emb = self.vib_tokenizer(normal_x)
+                n_emb = n_emb.to(device=input_embeddings.device, dtype=input_embeddings.dtype)
+                c_emb = self.vib_tokenizer(current_x)
+                c_emb = c_emb.to(device=input_embeddings.device, dtype=input_embeddings.dtype)
+                
+                # Expand to match the number of positions if there are multiple matches
+                n_emb = n_emb.unsqueeze(0) if n_emb.dim() == 1 else n_emb
+                c_emb = c_emb.unsqueeze(0) if c_emb.dim() == 1 else c_emb
+                input_embeddings[i, n_pos] = n_emb.expand(n_pos.shape[0], -1)
+                input_embeddings[i, c_pos] = c_emb.expand(c_pos.shape[0], -1)
+
+            prompt_inputs["input_ids"], prompt_inputs["attention_mask"] = prompt_ids, prompt_mask
             prompt_completion_ids = unwrapped_model.generate(
                 inputs_embeds=input_embeddings, attention_mask=prompt_mask, generation_config=self.generation_config
             )
 
-            # Log one example to wandb as HTML every 100 steps
-            if self.state.global_step % 100 == 0:
-                sample_prompt = self.processing_class.decode(prompt_ids[0], skip_special_tokens=False)
-                sample_output = self.processing_class.decode(prompt_completion_ids[0], skip_special_tokens=False)
-
-                html_str = f"""
-                <div style='font-family:monospace'>
-                    <b>Prompt:</b><br>
-                    <pre>{escape(sample_prompt)}</pre><br>
-                    <b>Output:</b><br>
-                    <pre>{escape(sample_output)}</pre>
-                </div>
-                """
-
-                wandb.log({"generation_html": wandb.Html(html_str)}, step=self.state.global_step)
-
-        # Compute prompt length and extract completion ids
+        # Compute prompt length and extract completion ids 
         prompt_length = prompt_ids.size(1)
         prompt_ids = prompt_completion_ids[:, :prompt_length]
         completion_ids = prompt_completion_ids[:, prompt_length:]
-
+        
         # Mask everything after the first EOS token
-        is_eos = completion_ids == self.processing_class.eos_token_id
+        is_eos = completion_ids == self.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
@@ -143,38 +193,69 @@ class CustomGRPOTRainer(GRPOTrainer):
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
 
         with torch.no_grad():
-            # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
-            # old_per_token_logps == per_token_logps, so we can skip it's computation here, and use
-            # per_token_logps.detach() instead.
-            if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
-                old_per_token_logps = self._get_per_token_logps_and_entropies(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
-                )["logps"]
+            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
+            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
+            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
+            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
+            # old_per_token_logps to None.
+            generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+            if self.args.gradient_accumulation_steps % generate_every != 0:
+                old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                    self.model,
+                    prompt_completion_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    batch_size,
+                    pixel_values=prompt_inputs.get("pixel_values"),
+                    image_grid_thw=prompt_inputs.get("image_grid_thw"),
+                    pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+                    image_sizes=prompt_inputs.get("image_sizes"),
+                )
             else:
                 old_per_token_logps = None
-
+                
             # Compute the per-token log probabilities for the reference model
             if self.beta != 0.0:
                 if self.ref_model is not None:
-                    ref_per_token_logps = self._get_per_token_logps_and_entropies(
-                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-                    )["logps"]
+                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model,
+                        prompt_completion_ids,
+                        attention_mask,
+                        logits_to_keep,
+                        batch_size=batch_size,
+                        pixel_values=prompt_inputs.get("pixel_values"),
+                        image_grid_thw=prompt_inputs.get("image_grid_thw"),
+                        pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+                        image_sizes=prompt_inputs.get("image_sizes"),
+                    )
                 else:
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps = self._get_per_token_logps_and_entropies(
-                            self.model, prompt_completion_ids, attention_mask, logits_to_keep
-                        )["logps"]
+                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
+                            self.model,
+                            prompt_completion_ids,
+                            attention_mask,
+                            logits_to_keep,
+                            batch_size=batch_size,
+                            pixel_values=prompt_inputs.get("pixel_values"),
+                            image_grid_thw=prompt_inputs.get("image_grid_thw"),
+                            pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
+                            image_sizes=prompt_inputs.get("image_sizes"),
+                        )
             else:
                 ref_per_token_logps = None
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        completions = completions_text
 
+        # 여기에 생성부분만 남기도록 후처리 필요 (Custom)
+        completions = completions_text
+        print(f'prompt : {prompts}')
+        print(f'response : {completions}')
+        
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
         # rewards_per_func to extract each process's subset.
-        rewards_per_func = self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        rewards_per_func = self._calculate_rewards(inputs, original_prompts, completions, completion_ids_list)
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
@@ -232,46 +313,114 @@ class CustomGRPOTRainer(GRPOTrainer):
         self._metrics[mode]["frac_reward_zero_std"].append(is_std_zero.float().mean().item())
 
         # Log prompt and completion texts
-        self._textual_logs["prompt"].extend(gather_object(prompts_text))
-        self._textual_logs["completion"].extend(gather_object(completions_text))
+        self._logs["prompt"].extend(gather_object(prompts_text))
+        self._logs["completion"].extend(gather_object(completions_text))
         for i, name in enumerate(self.reward_func_names):
-            self._textual_logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
-        self._textual_logs["advantages"].extend(all_process_advantages.tolist())
+            self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
+        self._logs["advantages"].extend(all_process_advantages.tolist())
 
-        return {
+        if has_images:
+            self._logs["image"].extend(gather_object(images))
+
+        output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
             "advantages": advantages,
-            "old_per_token_logps": old_per_token_logps,
-            "ref_per_token_logps": ref_per_token_logps,
         }
+        if old_per_token_logps is not None:
+            output["old_per_token_logps"] = old_per_token_logps
+        if ref_per_token_logps is not None:
+            output["ref_per_token_logps"] = ref_per_token_logps
+        if "pixel_values" in prompt_inputs:
+            output["pixel_values"] = prompt_inputs["pixel_values"]
+        if "image_grid_thw" in prompt_inputs:
+            output["image_grid_thw"] = prompt_inputs["image_grid_thw"]
+        if "pixel_attention_mask" in prompt_inputs:
+            output["pixel_attention_mask"] = prompt_inputs["pixel_attention_mask"]
+        if "image_sizes" in prompt_inputs:
+            output["image_sizes"] = prompt_inputs["image_sizes"]
+        return output
         
 
 def reward_accuracy(completions, answers, **kwargs):
+    """
+    정답 보상: <answer>{...}</answer> 내부 JSON에서 final_label을 파싱하여 정답과 일치하면 1.0, 아니면 0.0
+    answers는 데이터셋이 제공하는 정답(문자열)로 가정.
+    """
     rewards = []
     for completion, correct_answer in zip(completions, answers):
         try:
-            print(f'completion[content] : {completion["content"]}')
             text = completion["content"] if isinstance(completion, dict) else completion
             m = re.search(r"<answer>(.*?)</answer>", text or "", re.DOTALL)
-            answer = m.group(1).strip() if m else ""
-            is_correct = answer.strip().lower() == correct_answer.strip().lower()
-            reward = 1.0 if is_correct else 0.0
-            rewards.append(reward)
+            answer_body = m.group(1).strip() if m else ""
+            # JSON 파싱 시도
+            parsed = None
+            try:
+                parsed = json.loads(answer_body)
+            except Exception:
+                # 마지막 쉼표 등 사소한 오류가 있을 수 있어, 최후 수단: 정규식으로 final_label만 추출
+                mm = re.search(r'\"final_label\"\s*:\s*\"([^\"]+)\"', answer_body)
+                if mm:
+                    parsed = {"final_label": mm.group(1)}
+            final_label = (parsed or {}).get("final_label", "")
+            is_correct = str(final_label).strip().lower() == str(correct_answer).strip().lower()
+            rewards.append(1.0 if is_correct else 0.0)
         except Exception as e:
             print(f"[Reward Parse Error] {e}")
             rewards.append(0.0)
     return rewards
 
 def reward_format(completions, **kwargs):
+    """
+    형식 보상: 아래 조건을 모두 만족하면 1.0, 아니면 0.0
+    - 정확히 하나의 <reasoning>...</reasoning> 블록 존재
+    - 정확히 하나의 <answer>{JSON}</answer> 블록 존재 (코드펜스 금지)
+    - answer JSON에 필수 키 존재: vib_only_label, vib_reason, knowledge_only_label, knowledge_reason, final_label, fusion_reason
+    - 중복 답변/여분 텍스트 없음 (블록 외 불필요한 텍스트가 실질적으로 없어야 함)
+    """
+    required_keys = {
+        "vib_only_label",
+        "vib_reason",
+        "knowledge_only_label",
+        "knowledge_reason",
+        "final_label",
+        "fusion_reason",
+    }
     rewards = []
     for completion in completions:
         try:
             text = completion["content"] if isinstance(completion, dict) else completion
-            pattern = r"^<think>.*?</think><answer>.*?</answer>$"
-            rewards.append(1.0 if re.match(pattern, text.strip(), re.DOTALL) else 0.0)
+            s = text.strip()
+            # 코드펜스가 있으면 실패
+            if "```" in s:
+                rewards.append(0.0)
+                continue
+            # reasoning / answer 매칭
+            reasoning_matches = re.findall(r"<reasoning>(.*?)</reasoning>", s, re.DOTALL)
+            answer_matches = re.findall(r"<answer>(\{.*?\})</answer>", s, re.DOTALL)
+            if len(reasoning_matches) != 1 or len(answer_matches) != 1:
+                rewards.append(0.0)
+                continue
+            # answer JSON 파싱 및 키 검증
+            ok = False
+            try:
+                answer_obj = json.loads(answer_matches[0])
+                ok = required_keys.issubset(set(answer_obj.keys()))
+            except Exception:
+                ok = False
+            if not ok:
+                rewards.append(0.0)
+                continue
+            # 중복/여분 텍스트 최소화: 태그 제거 후 공백만 남아야 하는지 검사(관대하게 공백/개행 허용)
+            cleaned = re.sub(r"<reasoning>.*?</reasoning>", "", s, flags=re.DOTALL)
+            cleaned = re.sub(r"<answer>.*?</answer>", "", cleaned, flags=re.DOTALL)
+            if cleaned.strip() != "":
+                # 여분 텍스트가 있으면 0.0 (중복/군더더기 방지)
+                rewards.append(0.0)
+                continue
+            rewards.append(1.0)
         except Exception as e:
             print(f"[Format Parse Error] {e}")
             rewards.append(0.0)
