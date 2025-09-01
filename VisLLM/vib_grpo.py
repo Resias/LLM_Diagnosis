@@ -343,33 +343,63 @@ class CustomGRPOTRainer(GRPOTrainer):
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
         
-
-def reward_accuracy(completions, answers, **kwargs):
+def reward_accuracy_weighted(completions, answers, **kwargs):
     """
-    정답 보상: <answer>{...}</answer> 내부 JSON에서 final_label을 파싱하여 정답과 일치하면 1.0, 아니면 0.0
-    answers는 데이터셋이 제공하는 정답(문자열)로 가정.
+    가중치 기반 정답 보상 함수입니다.
+    - vib_only_label, knowledge_only_label, final_label의 정확도를 각각 평가합니다.
+    - 최종 정답(final_label)에 더 높은 가중치를 부여합니다.
+    - 세 항목의 가중치 합이 최종 보상이 됩니다. (최대 1.0)
     """
+    # --- 가중치 설정 ---
+    # vib_only와 knowledge_only에 동등한 보상, final_label에 높은 보상을 부여합니다.
+    W_VIB = 0.25
+    W_KNOWLEDGE = 0.25
+    W_FINAL = 0.5  # 가장 중요한 최종 진단에 50%의 가중치 부여
+    
     rewards = []
     for completion, correct_answer in zip(completions, answers):
+        current_reward = 0.0
         try:
             text = completion["content"] if isinstance(completion, dict) else completion
+            # <answer> 블록의 JSON 내용을 추출
             m = re.search(r"<answer>(.*?)</answer>", text or "", re.DOTALL)
-            answer_body = m.group(1).strip() if m else ""
-            # JSON 파싱 시도
-            parsed = None
+            if not m:
+                rewards.append(0.0)
+                continue
+
+            answer_body = m.group(1).strip()
+            
+            # JSON 파싱을 시도하고, 실패하면 보상은 0점
+            # 형식이 깨진 응답은 reward_format에서 패널티를 받으므로, 여기서는 내용의 정확도에만 집중
             try:
                 parsed = json.loads(answer_body)
-            except Exception:
-                # 마지막 쉼표 등 사소한 오류가 있을 수 있어, 최후 수단: 정규식으로 final_label만 추출
-                mm = re.search(r'\"final_label\"\s*:\s*\"([^\"]+)\"', answer_body)
-                if mm:
-                    parsed = {"final_label": mm.group(1)}
-            final_label = (parsed or {}).get("final_label", "")
-            is_correct = str(final_label).strip().lower() == str(correct_answer).strip().lower()
-            rewards.append(1.0 if is_correct else 0.0)
+            except json.JSONDecodeError:
+                rewards.append(0.0)
+                continue
+
+            # 각 레이블을 안전하게 추출
+            vib_label = str(parsed.get("vib_only_label", "")).strip().lower()
+            knowledge_label = str(parsed.get("knowledge_only_label", "")).strip().lower()
+            final_label = str(parsed.get("final_label", "")).strip().lower()
+            
+            # 정답과 비교하여 가중치 적용
+            ground_truth = str(correct_answer).strip().lower()
+            
+            if vib_label == ground_truth:
+                current_reward += W_VIB
+            
+            if knowledge_label == ground_truth:
+                current_reward += W_KNOWLEDGE
+                
+            if final_label == ground_truth:
+                current_reward += W_FINAL
+            
+            rewards.append(current_reward)
+
         except Exception as e:
-            print(f"[Reward Parse Error] {e}")
+            print(f"[Reward Parse Error] Completion: '{completion[:100]}...' | Error: {e}")
             rewards.append(0.0)
+            
     return rewards
 
 def reward_format(completions, **kwargs):
@@ -387,41 +417,45 @@ def reward_format(completions, **kwargs):
         "knowledge_reason",
         "final_label",
         "fusion_reason",
+        # 'criteria' 키도 프롬프트에 있으므로 추가하는 것을 권장합니다.
+        "criteria", 
     }
     rewards = []
     for completion in completions:
         try:
             text = completion["content"] if isinstance(completion, dict) else completion
             s = text.strip()
-            # 코드펜스가 있으면 실패
+            
+            # 1. 코드펜스가 있으면 실패
             if "```" in s:
                 rewards.append(0.0)
                 continue
-            # reasoning / answer 매칭
-            reasoning_matches = re.findall(r"<reasoning>(.*?)</reasoning>", s, re.DOTALL)
-            answer_matches = re.findall(r"<answer>(\{.*?\})</answer>", s, re.DOTALL)
+            
+            # 2. reasoning / answer 블록이 정확히 하나씩 있는지 확인
+            reasoning_matches = re.findall(r"<reasoning>.*?</reasoning>", s, re.DOTALL)
+            answer_matches = re.findall(r"<answer>.*?</answer>", s, re.DOTALL)
             if len(reasoning_matches) != 1 or len(answer_matches) != 1:
                 rewards.append(0.0)
                 continue
-            # answer JSON 파싱 및 키 검증
-            ok = False
-            try:
-                answer_obj = json.loads(answer_matches[0])
-                ok = required_keys.issubset(set(answer_obj.keys()))
-            except Exception:
-                ok = False
-            if not ok:
+
+            # 3. answer JSON 파싱 및 키 검증
+            answer_content_match = re.search(r"<answer>(.*?)</answer>", s, re.DOTALL)
+            answer_obj = json.loads(answer_content_match.group(1))
+            if not required_keys.issubset(set(answer_obj.keys())):
                 rewards.append(0.0)
                 continue
-            # 중복/여분 텍스트 최소화: 태그 제거 후 공백만 남아야 하는지 검사(관대하게 공백/개행 허용)
+            
+            # 4. 블록 외 불필요한 텍스트가 있는지 확인
             cleaned = re.sub(r"<reasoning>.*?</reasoning>", "", s, flags=re.DOTALL)
             cleaned = re.sub(r"<answer>.*?</answer>", "", cleaned, flags=re.DOTALL)
             if cleaned.strip() != "":
-                # 여분 텍스트가 있으면 0.0 (중복/군더더기 방지)
                 rewards.append(0.0)
                 continue
-            rewards.append(1.0)
-        except Exception as e:
-            print(f"[Format Parse Error] {e}")
+                
+            rewards.append(1.0) # 모든 조건을 통과하면 1.0
+            
+        except Exception:
+            # 파싱 오류 등 예외 발생 시 형식 점수는 0
             rewards.append(0.0)
+            
     return rewards

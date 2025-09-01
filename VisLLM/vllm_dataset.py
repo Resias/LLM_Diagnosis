@@ -320,13 +320,64 @@ class LLMDataset_Cache(torch.utils.data.Dataset):
         normal_knowledge = normal_info['knowledge']
         
         system_prompt = (
-            f'핵멋있는 System Prompt'
+            "You are a world-class AI diagnostic engineer specializing in the vibration analysis of rotating machinery. "
+            "Your mission is to meticulously analyze vibration data and associated physical knowledge to deliver a precise and well-supported diagnosis. "
+            "You must follow a structured, multi-stage reasoning process and present your findings in the exact format required."
         )
-        user_prompt = (
-            f"개쩌는 User Prompt "
-        )
+        user_prompt = f"""
+        ### **TASK DESCRIPTION**
+        Your task is to diagnose the current state of a rotating machine. Based on the provided data, you must classify the state into one of the following five categories: **normal(healthy), misalignment, looseness, unbalance, bearing fault**.
 
-        prompt_only = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
+        ### **PROVIDED DATA**
+
+        **1. Vibration Tokens (Proprietary Embeddings):**
+        - Normal State Token: `<NORMAL_VIB_EMB>`
+        - Current State Token: `<CURRENT_VIB_EMB>`
+
+        **2. Physical Knowledge (Extracted Features):**
+        - Normal State Features: "{normal_knowledge}"
+        - Current State Features: "{current_knowledge}"
+
+        **3. Analysis Plan & Diagnostic Criteria (Reference Guide):**
+        This guide outlines the step-by-step analysis process and the criteria for each potential fault. You must use this as your primary reference for knowledge-based analysis.
+        - Plan: {plan_text}
+
+        ### **INSTRUCTIONS**
+
+        You must perform a rigorous 3-step diagnostic reasoning process. Adhere strictly to the following structure within the `<reasoning>` block.
+
+        <reasoning>
+        **Step 1: Vibration Token-based Analysis**
+        1.1. Compare the `<CURRENT_VIB_EMB>` with the `<NORMAL_VIB_EMB>`. Based on their similarity (or lack thereof), what is the initial diagnosis? A significant deviation from the normal token suggests a fault.
+        1.2. Briefly state the most likely condition suggested by the vibration tokens alone.
+
+        **Step 2: Physical Knowledge-based Analysis**
+        2.1. **Feature Comparison**: Compare the 'Current State Features' against the 'Normal State Features'. Note any significant differences in RMS, Kurtosis, and Crest Factor.
+        2.2. **Spectral Analysis**: Examine the 'TopPeaksHz' and 'Orders' in the current state. According to the 'Analysis Plan', do these spectral components indicate a specific fault (e.g., harmonics for unbalance/misalignment, non-harmonics for bearing faults)?
+        2.3. **Criteria Matching**: Systematically check the diagnostic ideas for each fault type listed in the 'Analysis Plan'. Which condition's criteria best match the 'Current State Features'? Provide evidence.
+
+        **Step 3: Fused Decision**
+        3.1. **Synthesize Findings**: Combine the conclusions from Step 1 (token-based) and Step 2 (knowledge-based).
+        3.2. **Final Diagnosis**: If they agree, confirm the diagnosis. If they conflict, determine which conclusion is supported by stronger evidence and state your final diagnosis.
+        3.3. **Key Indicators**: List the top 2-3 most critical indicators from the physical features that led to your final decision.
+        </reasoning>
+
+        ### **OUTPUT FORMAT**
+
+        Provide your final answer in the JSON format below, enclosed within an `<answer>` block. Do not add any text or explanations outside the `<reasoning>` and `<answer>` blocks.
+
+        <answer>{{
+        "vib_only_label": "<The diagnosis from Step 1.2>",
+        "vib_reason": "<A brief sentence explaining the token-based conclusion>",
+        "knowledge_only_label": "<The diagnosis from Step 2.3>",
+        "knowledge_reason": "<A brief sentence explaining the knowledge-based conclusion>",
+        "criteria": "<The key indicators from Step 3.3>",
+        "final_label": "<Your final diagnosis from Step 3.2>",
+        "fusion_reason": "<A brief sentence explaining how you reconciled the two analyses to reach the final decision>"
+        }}</answer>
+        """
+
+        prompt_only = f"System: {system_prompt}\n User: {user_prompt}\n Assistant:"
         
         assistant_response = f"The diagnosis result is {current_info['label_class']}."
 
