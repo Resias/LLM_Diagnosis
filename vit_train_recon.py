@@ -21,6 +21,14 @@ from tqdm import tqdm
 import argparse
 import types
 
+def reconstruction_mse(rec_tokens, imgs, patch_size):
+    """
+    rec_tokens: (N, L, D)  # 모델이 전체 L 패치 토큰을 예측한다고 가정
+    imgs:      (N, C, H, W)
+    """
+    target_tokens = patchify(imgs, patch_size)  # (N, L, D)
+    diff = rec_tokens - target_tokens           # 전체 패치에 대해
+    return (diff * diff).mean()
 
 def masked_patch_mse(rec_tokens, imgs, ids_keep, patch_size):
     # rec_tokens: (N, L, P*P*C), target_tokens: 동일 크기
@@ -40,8 +48,24 @@ def _ddp_sum_tensor(t):
 def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank, config):
     best_val_acc = 0.0
     is_main_process = rank == 0  # 메인 프로세스 여부 확인
+    warmup_epochs = getattr(config, "warmup_epochs", 0)   # 새 인자 사용
     
     for epoch in range(num_epochs):
+        LOG_EMBED_INTERVAL = 10  # 고정 주기. 0이면 비활성화, >0이면 해당 주기마다만 로깅
+        should_log_embed = (
+            is_main_process and wandb.run is not None and
+            LOG_EMBED_INTERVAL > 0 and
+            ((epoch == 0) or ((epoch + 1) % LOG_EMBED_INTERVAL == 0))
+        )
+
+        # --- (핵심) 에폭별 α 결정: 워밍업 구간에서는 분류 손실 비중 0 ---
+        if epoch < warmup_epochs:
+            effective_alpha = 0.0
+            phase_name = "warmup"
+        else:
+            effective_alpha = float(alpha)
+            phase_name = "finetune"
+        
         # sampler의 epoch 설정
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
@@ -75,9 +99,10 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             optimizer.zero_grad()
             logits, rec_img, aux, cls_feat, diff_feat = model(inputs, inputs_n, return_feats=True)
             loss_cls = criterion(logits, labels)
-            loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
+            # loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
+            loss_rec = reconstruction_mse(aux["rec_tokens"], inputs, patch_size=16)
 
-            loss = alpha * loss_cls + (1 - alpha) * loss_rec
+            loss = effective_alpha * loss_cls + (1 - effective_alpha) * loss_rec
             loss.backward()
             optimizer.step()
 
@@ -164,41 +189,42 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             # W&B Table (M rows)
             # 권장: Table 로깅 모드 지정 (INCREMENTAL/MUTABLE/IMMUTABLE) – 최근 가이드 참고
             # https://docs.wandb.ai/guides/models/tables/log_tables/
-            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+            if should_log_embed:
+                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
 
-            E = embeds_s.cpu().numpy().tolist()
-            P = ypred_s.cpu().numpy().tolist()
-            Y = ytrue_s.cpu().numpy().tolist()
+                E = embeds_s.cpu().numpy().tolist()
+                P = ypred_s.cpu().numpy().tolist()
+                Y = ytrue_s.cpu().numpy().tolist()
 
-            for i in range(len(E)):
-                table.add_data(
-                    E[i],
-                    int(P[i]),
-                    int(Y[i]),
-                    ds_s[i],
-                    "train",
-                    int(epoch))
-            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-            # https://docs.wandb.ai/guides/track/limits/
-            wandb.log({f"embeddings/train": table, "epoch": int(epoch)})
+                for i in range(len(E)):
+                    table.add_data(
+                        E[i],
+                        int(P[i]),
+                        int(Y[i]),
+                        ds_s[i],
+                        "train",
+                        int(epoch))
+                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+                # https://docs.wandb.ai/guides/track/limits/
+                wandb.log({f"embeddings/train": table, "epoch": int(epoch)})
             
-            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
 
-            E = embeds_diff.cpu().numpy().tolist()
-            P = ypred_s.cpu().numpy().tolist()
-            Y = ytrue_s.cpu().numpy().tolist()
+                E = embeds_diff.cpu().numpy().tolist()
+                P = ypred_s.cpu().numpy().tolist()
+                Y = ytrue_s.cpu().numpy().tolist()
 
-            for i in range(len(E)):
-                table.add_data(
-                    E[i],
-                    int(P[i]),
-                    int(Y[i]),
-                    ds_s[i],
-                    "train_diff",
-                    int(epoch))
-            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-            # https://docs.wandb.ai/guides/track/limits/
-            wandb.log({f"embeddings/train_diff": table, "epoch": int(epoch)})
+                for i in range(len(E)):
+                    table.add_data(
+                        E[i],
+                        int(P[i]),
+                        int(Y[i]),
+                        ds_s[i],
+                        "train_diff",
+                        int(epoch))
+                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+                # https://docs.wandb.ai/guides/track/limits/
+                wandb.log({f"embeddings/train_diff": table, "epoch": int(epoch)})
 
         # Validation phase
         model.eval()
@@ -221,9 +247,11 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
                 logits, rec_img, aux, cls_feat, diff_feat = model(inputs, inputs_n, return_feats=True)
                 b_loss_cls = criterion(logits, labels)
-                b_loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
+                # b_loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
+                b_loss_rec = reconstruction_mse(aux["rec_tokens"], inputs, patch_size=16)
+
                 
-                b_loss = alpha * b_loss_cls + (1 - alpha) * b_loss_rec
+                b_loss = effective_alpha * b_loss_cls + (1 - effective_alpha) * b_loss_rec
 
                 # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
                 if is_main_process and i == 0 and wandb.run is not None:
@@ -297,41 +325,42 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             # W&B Table (M rows)
             # 권장: Table 로깅 모드 지정 (INCREMENTAL/MUTABLE/IMMUTABLE) – 최근 가이드 참고
             # https://docs.wandb.ai/guides/models/tables/log_tables/
-            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+            if should_log_embed:
+                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
 
-            E = embeds_s.cpu().numpy().tolist()
-            P = ypred_s.cpu().numpy().tolist()
-            Y = ytrue_s.cpu().numpy().tolist()
+                E = embeds_s.cpu().numpy().tolist()
+                P = ypred_s.cpu().numpy().tolist()
+                Y = ytrue_s.cpu().numpy().tolist()
 
-            for i in range(len(E)):
-                table.add_data(
-                    E[i],
-                    int(P[i]),
-                    int(Y[i]),
-                    ds_s[i],
-                    "val",
-                    int(epoch))
-            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-            # https://docs.wandb.ai/guides/track/limits/
-            wandb.log({f"embeddings/val": table, "epoch": int(epoch)})
-            
-            table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
+                for i in range(len(E)):
+                    table.add_data(
+                        E[i],
+                        int(P[i]),
+                        int(Y[i]),
+                        ds_s[i],
+                        "val",
+                        int(epoch))
+                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+                # https://docs.wandb.ai/guides/track/limits/
+                wandb.log({f"embeddings/val": table, "epoch": int(epoch)})
+                
+                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
 
-            E = embeds_diff.cpu().numpy().tolist()
-            P = ypred_s.cpu().numpy().tolist()
-            Y = ytrue_s.cpu().numpy().tolist()
+                E = embeds_diff.cpu().numpy().tolist()
+                P = ypred_s.cpu().numpy().tolist()
+                Y = ytrue_s.cpu().numpy().tolist()
 
-            for i in range(len(E)):
-                table.add_data(
-                    E[i],
-                    int(P[i]),
-                    int(Y[i]),
-                    ds_s[i],
-                    "val_diff",
-                    int(epoch))
-            # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-            # https://docs.wandb.ai/guides/track/limits/
-            wandb.log({f"embeddings/val_diff": table, "epoch": int(epoch)})
+                for i in range(len(E)):
+                    table.add_data(
+                        E[i],
+                        int(P[i]),
+                        int(Y[i]),
+                        ds_s[i],
+                        "val_diff",
+                        int(epoch))
+                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
+                # https://docs.wandb.ai/guides/track/limits/
+                wandb.log({f"embeddings/val_diff": table, "epoch": int(epoch)})
 
 
         if dist.is_available() and dist.is_initialized():
@@ -511,7 +540,7 @@ def train_with_config(rank, world_size, args):
     # 학습용 데이터셋 생성
     train_dataset = WindowedVibrationDataset(
         data_root=data_root,
-        using_dataset = ['iis', 'vat', 'vbl', 'mfd'],
+        using_dataset = ['vat', 'vbl', 'mfd'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',
@@ -640,7 +669,7 @@ def parse_args():
                         help='Path to the processed data directory')
     parser.add_argument('--sweep_config', type=str, default=None,
                         help='Path to wandb sweep configuration file')
-    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=40)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
     parser.add_argument('--image_size', type=int, default=256)
@@ -664,6 +693,9 @@ def parse_args():
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
                         help='Port for distributed training')
+    parser.add_argument('--warmup_epochs', type=int, default=100,
+                        help='epochs for reconstruction-only warm-up (classification weight=0)')
+
 
     return parser.parse_args()
 
