@@ -354,7 +354,10 @@ if __name__ == '__main__':
         transform=signal_imger
     )
     
-    # vit_l_16과 동일한 세팅의 ViT_AE
+    # vit_b_16과 동일한 세팅의 ViT_AE
+    # hidden_dim=768
+    # vit_l_16
+    # 
     vit_ae = VisionTransformerAE(
                     num_layers = 12,
                     num_heads = 12,
