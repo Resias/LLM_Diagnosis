@@ -7,6 +7,15 @@ from torchvision.models import vit_b_16, ViT_B_16_Weights, vit_l_16, ViT_L_16_We
 # 유틸: patchify / unpatchify
 # ---------------------------
 def patchify(img, patch_size):
+    """img(B, C, H, W) 를 입력받아 (B, n_patch, patch)dim)
+
+    Args:
+        img (_type_): _description_
+        patch_size (_type_): _description_
+
+    Returns:
+        _type_: _description_
+    """
     # img: (N, C, H, W)
     N, C, H, W = img.shape
     p = patch_size
@@ -370,6 +379,7 @@ class VITEnClassify(nn.Module):
     def forward(self, x, normal = None, return_feats: bool = False):
         """
         반환:
+            x 4,244,244
           logits: (N, num_classes)
           rec_pred: (N, C, H, W)         # 복원 이미지
           aux: dict(ids_restore, rec_tokens, mask_ratio)
