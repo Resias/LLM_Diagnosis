@@ -92,6 +92,8 @@ class VibrationTokenizer(nn.Module):
     def __init__(self, vib_encoder, token_embed_dim, freeze_encoder=True, embedding_dim=768):
         super().__init__()
         self.vib_encoder = vib_encoder
+        self.device = next(self.vib_encoder.parameters()).device
+        self.dtype = next(self.vib_encoder.parameters()).dtype
 
         if freeze_encoder:
             for param in self.vib_encoder.parameters():
@@ -110,24 +112,19 @@ class VibrationTokenizer(nn.Module):
             )
         )
 
-    def forward(self, current_x, normal_x):
+    def forward(self, x):
         # Ensure inputs are on the same device as the encoder/model
         device = next(self.vib_encoder.parameters()).device if self.vib_encoder is not None else next(self.model.parameters()).device
 
-        current_tensor = current_x.unsqueeze(0).to(device)
-        normal_tensor = normal_x.unsqueeze(0).to(device)
+        current_tensor = x.unsqueeze(0).to(device)
 
         sample_attn = self.vib_encoder._encode_full(current_tensor)
         sample_attn = sample_attn[:, 0, :]  # 768
 
-        normal_attn = self.vib_encoder._encode_full(normal_tensor)
-        normal_attn = normal_attn[:, 0, :]  # 768
-
-        current_z = self.model(sample_attn)
-        normal_z = self.model(normal_attn)
+        z = self.model(sample_attn)
 
         # Return CPU tensors so DataLoader pin_memory works properly
-        return current_z.detach().cpu(), normal_z.detach().cpu()
+        return z.detach().cpu()
 
 class VibrationSFTDataset(Dataset):
     def __init__(self,
@@ -294,7 +291,8 @@ class LLMDataset_Cache(torch.utils.data.Dataset):
     캐시를 원본 튜플 형식으로 다시 내보내는 래퍼
     (current_x, _, current_info, normal_x, _, normal_info, plan_text)
     """
-    def __init__(self, cache_blob, using_dataset=['iis']):
+    def __init__(self, cache_blob_path, using_dataset=['iis']):
+        cache_blob = torch.load(cache_blob_path)
         all_records = cache_blob["records"]
         all_datasets = cache_blob["dataset"]
         # using_dataset 안에 포함된 dataset만 남김
@@ -377,9 +375,13 @@ class LLMDataset_Cache(torch.utils.data.Dataset):
         }}</answer>
         """
 
-        prompt_only = f"System: {system_prompt}\n User: {user_prompt}\n Assistant:"
+        prompt_only = f"System: {system_prompt}\nUser: {user_prompt}\nAssistant:"
         
-        assistant_response = f"The diagnosis result is {current_info['label_class']}."
+        assistant_response = current_info['merged_class']
+        if assistant_response == 'normal':
+            assistant_response = 'normal(healthy)'
+        elif assistant_response == 'bearing':
+            assistant_response = 'bearing fault'
 
         return {
             'prompt': prompt_only,

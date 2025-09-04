@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from trl.models import unwrap_model_for_generation
 from html import escape
 import wandb
-
+from trl.trainer.utils import selective_log_softmax
 
 # torch.nanstd doesn't exist, so we define it here
 def nanstd(tensor: torch.Tensor) -> torch.Tensor:
@@ -46,6 +46,7 @@ class CustomGRPOTRainer(GRPOTrainer):
         peft_config=None,
         vib_tokenizer=None,   # 진동 토크나이저(Custom)
     ):
+        model.generation_config.eos_token_id = processing_class.convert_tokens_to_ids("</answer>")
         # 부모 초기화 그대로
         super().__init__(
             model=model,
@@ -61,16 +62,65 @@ class CustomGRPOTRainer(GRPOTrainer):
         )
         # 내가 추가한 것만 저장
         self.vib_tokenizer = vib_tokenizer
+        self.ans_ids = self.processing_class.convert_tokens_to_ids("</answer>")
+        self.eos_token_id = self.processing_class.convert_tokens_to_ids("</answer>")
+    
+    # 🚨 [수정 포인트 1] 모델 순전파(forward pass) 로직 중앙화
+    # 커스텀 임베딩 주입과 시퀀스 길이 문제를 이 메서드에서 모두 해결합니다.
+
+    def _get_per_token_logps_and_entropies(
+        self,
+        model,
+        completion_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        logits_to_keep: int,
+        **kwargs,
+    ):
+        unwrapped_model = model.module if hasattr(model, "module") else model
         
-    """
-    GRPO에 custom multi-modal 기능이 없어 구현
-    """
+        normal_x = kwargs.pop("normal_x", None)
+        current_x = kwargs.pop("current_x", None)
+
+        # 입력 텐서들을 logits_to_keep에 맞춰 미리 슬라이싱
+        input_ids = completion_ids[:, -logits_to_keep:]
+        input_mask = attention_mask[:, -logits_to_keep:]
+        
+        input_embeddings = unwrapped_model.get_input_embeddings()(input_ids)
+            
+        if normal_x is not None and current_x is not None:
+            normal_id = self.processing_class.convert_tokens_to_ids("<NORMAL_VIB_EMB>")
+            current_id = self.processing_class.convert_tokens_to_ids("<CURRENT_VIB_EMB>")
+            
+            # 🚨 [최종 수정] 루프의 기준과 내부 로직을 슬라이싱된 'input_ids'로 통일합니다.
+            for i in range(len(input_ids)):
+                n_pos = (input_ids[i] == normal_id).nonzero(as_tuple=True)[0]
+                c_pos = (input_ids[i] == current_id).nonzero(as_tuple=True)[0]
+
+                if n_pos.numel() > 0 and c_pos.numel() > 0:
+                    n_emb = self.vib_tokenizer(normal_x[i]).to(device=input_embeddings.device, dtype=input_embeddings.dtype)
+                    c_emb = self.vib_tokenizer(current_x[i]).to(device=input_embeddings.device, dtype=input_embeddings.dtype)
+                    # input_embeddings의 해당 위치에 직접 주입
+                    input_embeddings[i, n_pos] = n_emb.expand(n_pos.shape[0], -1)
+                    input_embeddings[i, c_pos] = c_emb.expand(c_pos.shape[0], -1)
+
+        outputs = model(inputs_embeds=input_embeddings, attention_mask=input_mask, use_cache=False, **kwargs)
+        logits = outputs.logits
+
+        logps = selective_log_softmax(logits, input_ids)
+        
+        all_logps = logits.log_softmax(dim=-1)
+        all_probs = torch.exp(all_logps)
+        entropies = -torch.sum(all_probs * all_logps, dim=-1)
+
+        return logps, entropies
+    
 
     def _generate_and_score_completions(
         self, inputs: list[dict[str, Union[torch.Tensor, Any]]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         mode = "train" if self.model.training else "eval"
+        
         
         prompts = [x["prompt"] for x in inputs]
         
@@ -105,7 +155,7 @@ class CustomGRPOTRainer(GRPOTrainer):
         prompt_inputs = self.processing_class(
             text=prompts_text, return_tensors="pt", padding=True, padding_side="left"
         )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        # prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
         
         # 스페셜 토큰의 위치를 찾아 저장한다. (Custom)
@@ -122,135 +172,93 @@ class CustomGRPOTRainer(GRPOTrainer):
             torch.no_grad(),
             FSDP.summon_full_params(self.model_wrapped, recurse=False) if self.is_fsdp_enabled else nullcontext(),
         ):
-            # Prepare input embeddings and replace special tokens with vibration embeddings
+            # --- Generation을 위한 임베딩 주입 ---
             prompt_ids = prompt_ids.to(self.model.device)
-            input_embeddings = self.model.get_input_embeddings()(prompt_ids.clone())
+            input_embeddings = self.model.get_input_embeddings()(prompt_ids)
             prompt_mask = prompt_mask.to(self.model.device)
 
-            # 진동 토큰 주입 파트(Custom)
+            normal_id = self.processing_class.convert_tokens_to_ids("<NORMAL_VIB_EMB>")
+            current_id = self.processing_class.convert_tokens_to_ids("<CURRENT_VIB_EMB>")
+
             for i in range(len(inputs)):
-                # Find positions of placeholder tokens in the tokenized prompt
-                # Use as_tuple=True to get a 1D index tensor and handle 0/1/Many occurrences robustly.
                 n_pos = (prompt_ids[i] == normal_id).nonzero(as_tuple=True)[0]
                 c_pos = (prompt_ids[i] == current_id).nonzero(as_tuple=True)[0]
-
-                # If placeholders are missing (e.g., due to truncation), skip replacement to avoid crashes.
-                if n_pos.numel() == 0 or c_pos.numel() == 0:
-                    assert f"[warn] Placeholder token(s) not found in sample {i}. "
-                    exit()
-
-                # Assign the same learned vibration embedding to all matching positions
-                # Ensure dtype/device match the model input embeddings
+                if n_pos.numel() == 0 or c_pos.numel() == 0: continue
+                
                 normal_x = inputs[i]['normal_x'].to(device=self.vib_tokenizer.device, dtype=self.vib_tokenizer.dtype)
                 current_x = inputs[i]['current_x'].to(device=self.vib_tokenizer.device, dtype=self.vib_tokenizer.dtype)
-                
-                n_emb = self.vib_tokenizer(normal_x)
-                n_emb = n_emb.to(device=input_embeddings.device, dtype=input_embeddings.dtype)
-                c_emb = self.vib_tokenizer(current_x)
-                c_emb = c_emb.to(device=input_embeddings.device, dtype=input_embeddings.dtype)
-                
-                # Expand to match the number of positions if there are multiple matches
-                n_emb = n_emb.unsqueeze(0) if n_emb.dim() == 1 else n_emb
-                c_emb = c_emb.unsqueeze(0) if c_emb.dim() == 1 else c_emb
+                n_emb = self.vib_tokenizer(normal_x).to(device=input_embeddings.device, dtype=input_embeddings.dtype)
+                c_emb = self.vib_tokenizer(current_x).to(device=input_embeddings.device, dtype=input_embeddings.dtype)
                 input_embeddings[i, n_pos] = n_emb.expand(n_pos.shape[0], -1)
                 input_embeddings[i, c_pos] = c_emb.expand(c_pos.shape[0], -1)
-
-            prompt_inputs["input_ids"], prompt_inputs["attention_mask"] = prompt_ids, prompt_mask
+            
             prompt_completion_ids = unwrapped_model.generate(
                 inputs_embeds=input_embeddings, attention_mask=prompt_mask, generation_config=self.generation_config
             )
-
-        # Compute prompt length and extract completion ids 
-        prompt_length = prompt_ids.size(1)
-        prompt_ids = prompt_completion_ids[:, :prompt_length]
-        completion_ids = prompt_completion_ids[:, prompt_length:]
+            
+        # --- 생성 후 처리 및 점수 계산 ---
+        completion_ids = prompt_completion_ids
         
-        # Mask everything after the first EOS token
         is_eos = completion_ids == self.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+        attention_mask = completion_mask
+        
 
         # Convert tensor to a list of lists of token IDs. This will be passed to the reward function, avoiding the need
         # to re-tokenize completions if the reward is computed from tokens.
-        completion_ids_list = [
-            [id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)
-        ]
-
-        # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
+        completion_ids_list = [[id.item() for id, m in zip(row, mask_row) if m] for row, mask_row in zip(completion_ids, completion_mask)]
         completion_lengths = completion_mask.sum(1)
 
-        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
-        if self.mask_truncated_completions:
-            truncated_completions = ~is_eos.any(dim=1)
-            completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
-
-        # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
-
-        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+        logits_to_keep = completion_ids.size(1)
         batch_size = self.args.per_device_train_batch_size if mode == "train" else self.args.per_device_eval_batch_size
+        
+        # 커스텀 데이터를 텐서로 변환
+        normal_x_tensor = torch.stack([inp['normal_x'] for inp in inputs])
+        current_x_tensor = torch.stack([inp['current_x'] for inp in inputs])
+
 
         with torch.no_grad():
-            # If the generation and optimization steps are misaligned—i.e., if generation does not occur at the end of
-            # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
-            # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
-            # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
-            generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
+            generate_every = self.args.steps_per_generation * self.num_iterations
             if self.args.gradient_accumulation_steps % generate_every != 0:
+                # 🚨 오버라이드한 중앙화된 메서드를 호출합니다. (커스텀 데이터 전달)
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                    self.model,
-                    prompt_completion_ids,
-                    attention_mask,
-                    logits_to_keep,
-                    batch_size,
-                    pixel_values=prompt_inputs.get("pixel_values"),
-                    image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                    pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                    image_sizes=prompt_inputs.get("image_sizes"),
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep,
+                    normal_x=normal_x_tensor, current_x=current_x_tensor
                 )
             else:
                 old_per_token_logps = None
-                
-            # Compute the per-token log probabilities for the reference model
+            
             if self.beta != 0.0:
                 if self.ref_model is not None:
-                    ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                        self.ref_model,
-                        prompt_completion_ids,
-                        attention_mask,
-                        logits_to_keep,
-                        batch_size=batch_size,
-                        pixel_values=prompt_inputs.get("pixel_values"),
-                        image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                        pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                        image_sizes=prompt_inputs.get("image_sizes"),
+                    # 🚨 ref_model은 커스텀 임베딩을 모르므로, 부모의 원본 메서드를 호출합니다.
+                    ref_per_token_logps, _ = super()._get_per_token_logps_and_entropies(
+                        self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
-                else:
+                else: # PEFT 어댑터를 사용하는 경우
                     with self.accelerator.unwrap_model(self.model).disable_adapter():
-                        ref_per_token_logps, _ = self._get_per_token_logps_and_entropies(
-                            self.model,
-                            prompt_completion_ids,
-                            attention_mask,
-                            logits_to_keep,
-                            batch_size=batch_size,
-                            pixel_values=prompt_inputs.get("pixel_values"),
-                            image_grid_thw=prompt_inputs.get("image_grid_thw"),
-                            pixel_attention_mask=prompt_inputs.get("pixel_attention_mask"),
-                            image_sizes=prompt_inputs.get("image_sizes"),
+                        ref_per_token_logps, _ = super()._get_per_token_logps_and_entropies(
+                            self.model, prompt_completion_ids, attention_mask, logits_to_keep
                         )
             else:
                 ref_per_token_logps = None
 
-        # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
 
+        # 프롬프트 부분 제거하여 순수 completion만 남기기
+        pure_completions_text = []
+        for i, comp_text in enumerate(completions_text):
+            prompt_text = prompts_text[i]
+            # prompt가 completion의 시작 부분에 있다면 제거
+            if comp_text.startswith(prompt_text):
+                pure_completions_text.append(comp_text[len(prompt_text):])
+            else:
+                pure_completions_text.append(comp_text)
+        
         # 여기에 생성부분만 남기도록 후처리 필요 (Custom)
-        completions = completions_text
-        print(f'prompt : {prompts}')
-        print(f'response : {completions}')
+        completions = pure_completions_text
         
         # Calculate rewards for each reward function. rewards_per_func aggregates rewards across all processes. This is
         # important because rewards will be normalized per group, and completions are distributed. We will later slice
@@ -322,6 +330,28 @@ class CustomGRPOTRainer(GRPOTrainer):
         if has_images:
             self._logs["image"].extend(gather_object(images))
 
+        if self.state.global_step > 0 and self.state.global_step % 10 == 0 and self.accelerator.is_main_process:
+            # 1. 가장 핵심적인 정보만 담을 테이블을 생성합니다.
+            table = wandb.Table(columns=["Global Step", "Completion", "Total Reward"])
+            
+            # 2. 로깅할 샘플 수를 정합니다 (예: 2-4개).
+            num_samples_to_log = min(len(completions), 4)
+            
+            for i in range(num_samples_to_log):
+                # 생성 결과와 보상 점수를 가져옵니다.
+                completion = completions[i]
+                total_reward = sum(rewards_per_func[i, j].item() for j in range(len(self.reward_func_names)))
+                
+                # 테이블에 데이터 한 줄을 추가합니다.
+                table.add_data(
+                    self.state.global_step,
+                    completion,
+                    total_reward
+                )
+            
+            # 3. 테이블을 WandB에 로깅합니다.
+            wandb.log({"generation_examples": table})
+
         output = {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
@@ -329,6 +359,10 @@ class CustomGRPOTRainer(GRPOTrainer):
             "completion_mask": completion_mask,
             "advantages": advantages,
         }
+         # 다음 단계(compute_loss)에서 _get_per_token_logps_and_entropies를 호출할 때 필요
+        output["normal_x"] = normal_x_tensor
+        output["current_x"] = current_x_tensor
+        
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
         if ref_per_token_logps is not None:
@@ -342,120 +376,184 @@ class CustomGRPOTRainer(GRPOTrainer):
         if "image_sizes" in prompt_inputs:
             output["image_sizes"] = prompt_inputs["image_sizes"]
         return output
-        
-def reward_accuracy_weighted(completions, answers, **kwargs):
-    """
-    가중치 기반 정답 보상 함수입니다.
-    - vib_only_label, knowledge_only_label, final_label의 정확도를 각각 평가합니다.
-    - 최종 정답(final_label)에 더 높은 가중치를 부여합니다.
-    - 세 항목의 가중치 합이 최종 보상이 됩니다. (최대 1.0)
-    """
-    # --- 가중치 설정 ---
-    # vib_only와 knowledge_only에 동등한 보상, final_label에 높은 보상을 부여합니다.
-    W_VIB = 0.25
-    W_KNOWLEDGE = 0.25
-    W_FINAL = 0.5  # 가장 중요한 최종 진단에 50%의 가중치 부여
     
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs=False,
+        **kwargs,
+    ):
+        old_per_token_logps = inputs["old_per_token_logps"]
+        ref_per_token_logps = inputs.get("ref_per_token_logps")
+        advantages = inputs["advantages"]
+        completion_ids = inputs["completion_ids"]
+        attention_mask = inputs["completion_mask"]
+
+        response_length = old_per_token_logps.shape[-1]
+        logits_to_keep = response_length + 1
+        
+        known_args = {
+            "completion_ids", "attention_mask", "advantages", "old_per_token_logps",
+            "ref_per_token_logps", "prompt_ids", "prompt_mask"
+        }
+        extra_kwargs = {k: v for k, v in inputs.items() if k not in known_args}
+        
+        per_token_logps, _ = self._get_per_token_logps_and_entropies(
+            model,
+            completion_ids,
+            attention_mask,
+            logits_to_keep,
+            **extra_kwargs,
+        )
+
+        log_ratio = per_token_logps - old_per_token_logps
+        
+        if self.beta != 0.0 and ref_per_token_logps is not None:
+            kl_penalty = self.beta * (per_token_logps - ref_per_token_logps)
+            log_ratio = log_ratio - kl_penalty
+
+        completion_log_ratio = log_ratio
+
+        expanded_advantages = advantages.unsqueeze(1).expand(-1, response_length)
+        completion_advantages = expanded_advantages
+        
+        # 🚨 [최종 수정] 마스크를 슬라이싱할 때 올바른 시작 인덱스를 사용합니다.
+        prompt_length = inputs["prompt_ids"].size(1)
+        start = prompt_length  # 👈 -1을 제거하여 올바른 시작점으로 수정
+        end = start + response_length
+        completion_mask = attention_mask[:, start:end]
+        
+        # 텐서 크기가 일치하는지 최종 확인 (디버깅용)
+        if completion_log_ratio.shape != completion_mask.shape:
+            # 길이를 맞추기 위한 예외 처리 (예: completion_mask가 더 긴 경우)
+            target_len = min(completion_log_ratio.shape[1], completion_mask.shape[1])
+            completion_log_ratio = completion_log_ratio[:, :target_len]
+            completion_advantages = completion_advantages[:, :target_len]
+            completion_mask = completion_mask[:, :target_len]
+
+        # 패딩된 토큰의 영향을 받지 않도록 마스크를 곱해줍니다.
+        loss = -0.5 * (completion_log_ratio * completion_advantages * completion_mask).sum() / completion_mask.sum()
+        
+        return loss if not return_outputs else (loss, {"loss": loss})
+
+def reward_accuracy(completions, answers, **kwargs):
+    """
+    세분화된 정답 보상:
+    - vib_only_label 정답 시: +0.2점
+    - knowledge_only_label 정답 시: +0.2점
+    - final_label 정답 시: +0.6점
+    최대 1.0점, 모두 틀리면 0.0점
+    """
     rewards = []
-    for completion, correct_answer in zip(completions, answers):
-        current_reward = 0.0
+    for completion, correct_answers_dict in zip(completions, answers):
         try:
+            current_reward = 0.0
             text = completion["content"] if isinstance(completion, dict) else completion
-            # <answer> 블록의 JSON 내용을 추출
-            m = re.search(r"<answer>(.*?)</answer>", text or "", re.DOTALL)
+
+            # <answer> 블록에서 JSON 파싱
+            m = re.search(r"<answer>\s*(\{.*?\})\s*</answer>", text or "", re.DOTALL)
             if not m:
                 rewards.append(0.0)
                 continue
-
+            
             answer_body = m.group(1).strip()
-            
-            # JSON 파싱을 시도하고, 실패하면 보상은 0점
-            # 형식이 깨진 응답은 reward_format에서 패널티를 받으므로, 여기서는 내용의 정확도에만 집중
-            try:
-                parsed = json.loads(answer_body)
-            except json.JSONDecodeError:
-                rewards.append(0.0)
-                continue
+            parsed = json.loads(answer_body)
 
-            # 각 레이블을 안전하게 추출
-            vib_label = str(parsed.get("vib_only_label", "")).strip().lower()
-            knowledge_label = str(parsed.get("knowledge_only_label", "")).strip().lower()
-            final_label = str(parsed.get("final_label", "")).strip().lower()
-            
-            # 정답과 비교하여 가중치 적용
-            ground_truth = str(correct_answer).strip().lower()
-            
-            if vib_label == ground_truth:
-                current_reward += W_VIB
-            
-            if knowledge_label == ground_truth:
-                current_reward += W_KNOWLEDGE
-                
-            if final_label == ground_truth:
-                current_reward += W_FINAL
+            # 1. vib_only_label 확인
+            vib_label = parsed.get("vib_only_label", "").strip().lower()
+            correct_vib_label = correct_answers_dict.get("vib_only_label", "").strip().lower()
+            if vib_label and vib_label == correct_vib_label:
+                current_reward += 0.2
+
+            # 2. knowledge_only_label 확인
+            knowledge_label = parsed.get("knowledge_only_label", "").strip().lower()
+            correct_knowledge_label = correct_answers_dict.get("knowledge_only_label", "").strip().lower()
+            if knowledge_label and knowledge_label == correct_knowledge_label:
+                current_reward += 0.2
+
+            # 3. final_label 확인
+            final_label = parsed.get("final_label", "").strip().lower()
+            correct_final_label = correct_answers_dict.get("final_label", "").strip().lower()
+            if final_label and final_label == correct_final_label:
+                current_reward += 0.6
             
             rewards.append(current_reward)
-
+            
         except Exception as e:
-            print(f"[Reward Parse Error] Completion: '{completion[:100]}...' | Error: {e}")
+            # print(f"[Reward Parse Error] {e}")
             rewards.append(0.0)
             
     return rewards
 
+
 def reward_format(completions, **kwargs):
-    """
-    형식 보상: 아래 조건을 모두 만족하면 1.0, 아니면 0.0
-    - 정확히 하나의 <reasoning>...</reasoning> 블록 존재
-    - 정확히 하나의 <answer>{JSON}</answer> 블록 존재 (코드펜스 금지)
-    - answer JSON에 필수 키 존재: vib_only_label, vib_reason, knowledge_only_label, knowledge_reason, final_label, fusion_reason
-    - 중복 답변/여분 텍스트 없음 (블록 외 불필요한 텍스트가 실질적으로 없어야 함)
-    """
     required_keys = {
-        "vib_only_label",
-        "vib_reason",
-        "knowledge_only_label",
-        "knowledge_reason",
-        "final_label",
-        "fusion_reason",
-        # 'criteria' 키도 프롬프트에 있으므로 추가하는 것을 권장합니다.
-        "criteria", 
+        "vib_only_label", "vib_reason", "knowledge_only_label",
+        "knowledge_reason", "final_label", "fusion_reason"
     }
     rewards = []
-    for completion in completions:
+    for i, completion in enumerate(completions):
         try:
+            # print(f"\n--- [DEBUG] CHECKING COMPLETION #{i+1} ---")
             text = completion["content"] if isinstance(completion, dict) else completion
             s = text.strip()
-            
-            # 1. 코드펜스가 있으면 실패
-            if "```" in s:
-                rewards.append(0.0)
-                continue
-            
-            # 2. reasoning / answer 블록이 정확히 하나씩 있는지 확인
-            reasoning_matches = re.findall(r"<reasoning>.*?</reasoning>", s, re.DOTALL)
-            answer_matches = re.findall(r"<answer>.*?</answer>", s, re.DOTALL)
-            if len(reasoning_matches) != 1 or len(answer_matches) != 1:
-                rewards.append(0.0)
-                continue
 
-            # 3. answer JSON 파싱 및 키 검증
-            answer_content_match = re.search(r"<answer>(.*?)</answer>", s, re.DOTALL)
-            answer_obj = json.loads(answer_content_match.group(1))
-            if not required_keys.issubset(set(answer_obj.keys())):
+            # 체크 1: 코드펜스
+            if "```" in s:
+                # print("FAIL: Found ``` backticks.")
                 rewards.append(0.0)
                 continue
+            # print("PASS: No backticks.")
+
+            # 체크 2: 블록 개수
+            reasoning_matches = re.findall(r"<reasoning>(.*?)</reasoning>", s, re.DOTALL)
+            answer_matches = re.findall(r"<answer>\s*(\{.*?\})\s*</answer>", s, re.DOTALL)
+            if len(reasoning_matches) != 1 or len(answer_matches) != 1:
+                # print(f"FAIL: Block count mismatch. Reasoning: {len(reasoning_matches)}, Answer: {len(answer_matches)}")
+                rewards.append(0.0)
+                continue
+            # print("PASS: Correct block count (Reasoning: 1, Answer: 1).")
+
+            # 체크 3: JSON 파싱 및 키 검증
+            ok = False
+            try:
+                answer_obj = json.loads(answer_matches[0])
+                # print("PASS: JSON parsed successfully.")
+                
+                missing_keys = required_keys - set(answer_obj.keys())
+                if not missing_keys:
+                    ok = True
+                # else:
+                    # print(f"FAIL: Required keys are missing: {missing_keys}")
+
+            except Exception as e:
+                # print(f"FAIL: JSON parse error: {e}")
+                ok = False
+
+            if not ok:
+                rewards.append(0.0)
+                continue
+            # print("PASS: All required JSON keys are present.")
             
-            # 4. 블록 외 불필요한 텍스트가 있는지 확인
+            # 체크 4: 불필요한 외부 텍스트
             cleaned = re.sub(r"<reasoning>.*?</reasoning>", "", s, flags=re.DOTALL)
             cleaned = re.sub(r"<answer>.*?</answer>", "", cleaned, flags=re.DOTALL)
             if cleaned.strip() != "":
+                # print(f"FAIL: Extra text found outside blocks: '{cleaned.strip()}'")
                 rewards.append(0.0)
                 continue
-                
-            rewards.append(1.0) # 모든 조건을 통과하면 1.0
-            
-        except Exception:
-            # 파싱 오류 등 예외 발생 시 형식 점수는 0
+            # print("PASS: No extra text found.")
+
+            # 모든 체크 통과
+            # print("SUCCESS: All format checks passed!")
+            rewards.append(1.0)
+
+        except Exception as e:
+            # print(f"[CRITICAL ERROR] in reward_format: {e}")
             rewards.append(0.0)
             
+    # print(f"--- [DEBUG] FINAL REWARDS: {rewards} ---\n")
     return rewards
+
