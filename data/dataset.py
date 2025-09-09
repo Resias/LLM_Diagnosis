@@ -339,18 +339,27 @@ class OrderInvariantSignalImager:
         self.stft_center = stft_center
         self.stft_power = stft_power
 
-
     # ---------- 유틸 ----------
     def _apply_log_norm(self, x: np.ndarray) -> np.ndarray:
         # x: (C, H, W)
         if self.log1p:
             x = np.sign(x) * np.log1p(np.abs(x))
+
         if self.normalize == "per_channel":
-            m = x.mean(axis=(1,2), keepdims=True)
-            s = x.std(axis=(1,2), keepdims=True) + self.eps
-            x = (x - m) / s
+            for c in range(x.shape[0]):
+                if c == x.shape[0] - 1:  # 마지막 채널(phase)은 정규화 건너뜀
+                    continue
+                m = x[c].mean()
+                s = x[c].std() + self.eps
+                x[c] = (x[c] - m) / s
+
         elif self.normalize == "global":
-            x = (x - x.mean()) / (x.std() + self.eps)
+            # 마지막 채널 제외하고 전체 mean/std 계산
+            chans = x[:-1]
+            m = chans.mean()
+            s = chans.std() + self.eps
+            x[:-1] = (chans - m) / s
+
         return x.astype(np.float32)
 
     def _resize_CHW(self, arr: np.ndarray, H_new: int, W_new: int) -> np.ndarray:
