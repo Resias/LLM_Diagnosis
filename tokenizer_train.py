@@ -9,11 +9,15 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
-from models.vit_encoder_recon import VITEnClassify, patchify
+
+from functools import partial
+
 from data.dataset import WindowedVibrationDataset, OrderInvariantSignalImager
 from sklearn.metrics import precision_score, recall_score, f1_score
-from utils.visualize import create_reconstruction_figure
+from tokenizer_trainer.visualize import create_reconstruction_figure
 import matplotlib.pyplot as plt
+
+from tokenizer_trainer.models.ViT_pytorch import VisionTransformerAE
 
 import wandb
 import ast
@@ -21,24 +25,8 @@ from tqdm import tqdm
 import argparse
 import types
 
-def reconstruction_mse(rec_tokens, imgs, patch_size):
-    """
-    rec_tokens: (N, L, D)  # 모델이 전체 L 패치 토큰을 예측한다고 가정
-    imgs:      (N, C, H, W)
-    """
-    target_tokens = patchify(imgs, patch_size)  # (N, L, D)
-    diff = rec_tokens - target_tokens           # 전체 패치에 대해
-    return (diff * diff).mean()
-
-def masked_patch_mse(rec_tokens, imgs, ids_keep, patch_size):
-    # rec_tokens: (N, L, P*P*C), target_tokens: 동일 크기
-    target_tokens = patchify(imgs, patch_size)  # (N, L, D)
-    N, L, D = target_tokens.shape
-    mask = torch.ones(N, L, device=target_tokens.device, dtype=torch.bool)
-    # keep 위치는 False(=가시), 나머지 True(=마스크)
-    mask.scatter_(1, ids_keep, False)
-    diff = (rec_tokens - target_tokens)[mask]   # 마스크 패치만
-    return (diff * diff).mean()
+def unwrap_ddp(model):
+    return model.module if isinstance(model, DDP) else model
 
 def _ddp_sum_tensor(t):
     if dist.is_available() and dist.is_initialized():
@@ -46,12 +34,14 @@ def _ddp_sum_tensor(t):
     return t
 
 def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank, config):
+    net = unwrap_ddp(model)  # <-- 추가
+
     best_val_acc = 0.0
     is_main_process = rank == 0  # 메인 프로세스 여부 확인
     warmup_epochs = getattr(config, "warmup_epochs", 0)   # 새 인자 사용
     
     for epoch in range(num_epochs):
-        LOG_EMBED_INTERVAL = 10  # 고정 주기. 0이면 비활성화, >0이면 해당 주기마다만 로깅
+        LOG_EMBED_INTERVAL = 50  # 고정 주기. 0이면 비활성화, >0이면 해당 주기마다만 로깅
         should_log_embed = (
             is_main_process and wandb.run is not None and
             LOG_EMBED_INTERVAL > 0 and
@@ -92,17 +82,27 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         for i, batch in enumerate(train_iter):
             if len(batch) == 3:
                 inputs, labels, info = batch
+                has_pair = False
             else:
-                inputs, labels, info, inputs_n, labels_n, info_n = batch
+                inputs, labels, info, inputs_n, labels_n, info_n = batch     
+                has_pair = True
+
             inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            if has_pair:
+                inputs_n = inputs_n.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            logits, rec_img, aux, cls_feat, diff_feat = model(inputs, inputs_n, return_feats=True)
-            loss_cls = criterion(logits, labels)
-            # loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
-            loss_rec = reconstruction_mse(aux["rec_tokens"], inputs, patch_size=16)
 
-            loss = effective_alpha * loss_cls + (1 - effective_alpha) * loss_rec
+            reconstructed_img, _, masked_indices = net.forward_mae(img=inputs)
+            # loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
+            loss_mae = nn.MSELoss()(reconstructed_img, inputs)
+            cls_feat = net.get_features(inputs)
+
+            predictions, diff_feat = net.forward_classify(current_img=inputs, normal_img=inputs_n)
+            loss_classify = criterion(predictions, labels)
+
+            loss = effective_alpha * loss_classify + (1 - effective_alpha) * loss_mae
+        
             loss.backward()
             optimizer.step()
 
@@ -111,7 +111,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0])
                 fig = create_reconstruction_figure(
                     orig_tensor=inputs[0],
-                    rec_tensor=rec_img[0],
+                    rec_tensor=reconstructed_img[0],
                     mode=config.stft_mode,  # config에서 파라미터 가져오기
                     max_order=config.max_order,
                     window_sec=config.window_sec
@@ -122,7 +122,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             
             bs = labels.size(0)
             loss_sum_local += loss.item() * bs
-            _, pred = logits.max(1)
+            _, pred = predictions.max(1)
             correct_local += (pred == labels).sum().item()
             total_local += bs
 
@@ -171,7 +171,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         
         project_cols = ("embedding", "pred", "label", "dataset", "split", "epoch")
         # (5) rank0만 로깅
-        max_points = 3000
+        max_points = 4000
         M = embeds_epoch.shape[0]
         if M > max_points:
             idx = torch.randperm(M)[:max_points]
@@ -242,23 +242,31 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             for i, batch  in enumerate(val_loader):
                 if len(batch) == 3:
                     inputs, labels, info = batch
+                    has_pair = False
                 else:
                     inputs, labels, info, inputs_n, labels_n, info_n = batch
+                    has_pair = True
                 inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                logits, rec_img, aux, cls_feat, diff_feat = model(inputs, inputs_n, return_feats=True)
-                b_loss_cls = criterion(logits, labels)
-                # b_loss_rec = masked_patch_mse(aux["rec_tokens"], inputs, aux["ids_keep"], patch_size=16)
-                b_loss_rec = reconstruction_mse(aux["rec_tokens"], inputs, patch_size=16)
+                if has_pair:
+                    inputs_n = inputs_n.to(device, non_blocking=True)
+            
+                reconstructed_img, _, masked_indices = net.forward_mae(img=inputs)
+                print(f"reconstructed_img: {reconstructed_img.shape}, inputs: {inputs.shape}")
+                # b_loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
+                b_loss_mae = nn.MSELoss()(reconstructed_img, inputs)
+                cls_feat = net.get_features(inputs)
 
-                
-                b_loss = effective_alpha * b_loss_cls + (1 - effective_alpha) * b_loss_rec
+                predictions, diff_feat = net.forward_classify(current_img=inputs, normal_img=inputs_n)
+                b_loss_classify = criterion(predictions, labels)
+
+                b_loss = effective_alpha * b_loss_classify + (1 - effective_alpha) * b_loss_mae
 
                 # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
                 if is_main_process and i == 0 and wandb.run is not None:
                     # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0])
                     fig = create_reconstruction_figure(
                         orig_tensor=inputs[0],
-                        rec_tensor=rec_img[0],
+                        rec_tensor=reconstructed_img[0],
                         mode=config.stft_mode,  # config에서 파라미터 가져오기
                         max_order=config.max_order,
                         window_sec=config.window_sec
@@ -269,7 +277,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
                 bs = labels.size(0)
                 val_loss_sum_local += b_loss.item() * bs
-                _, pred = logits.max(1)
+                _, pred = predictions.max(1)
                 val_correct_local += (pred == labels).sum().item()
                 val_total_local += bs
                 val_preds_local.append(pred.detach())
@@ -307,7 +315,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         
         project_cols = ("embedding", "pred", "label", "dataset", "split", "epoch")
         # (5) rank0만 로깅
-        max_points = 3000
+        max_points = 4000
         M = embeds_epoch.shape[0]
         if M > max_points:
             idx = torch.randperm(M)[:max_points]
@@ -374,10 +382,10 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 'train_acc': train_acc,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
-                "train/loss_cls": loss_cls.item(),
-                "train/loss_rec": loss_rec.item(),
-                "val/loss_cls": b_loss_cls.item(),
-                "val/loss_rec": b_loss_rec.item(),
+                "train/loss_cls": loss_classify.item(),
+                "train/loss_rec": loss_mae.item(),
+                "val/loss_cls": b_loss_classify.item(),
+                "val/loss_rec": b_loss_mae.item(),
             }
 
             # 🌟 [수정] 생성된 이미지가 있으면 log_dict에 추가
@@ -524,7 +532,7 @@ def train_with_config(rank, world_size, args):
     signal_imger = OrderInvariantSignalImager(
         mode=config.stft_mode,
         log1p=True,
-        normalize="none",
+        normalize="per_channel", 
         eps=1e-8,
         out_dtype=torch.float32,
         max_order=config.max_order,
@@ -540,10 +548,10 @@ def train_with_config(rank, world_size, args):
     # 학습용 데이터셋 생성
     train_dataset = WindowedVibrationDataset(
         data_root=data_root,
-        using_dataset = ['vat', 'vbl', 'mfd'],
+        using_dataset = ['dxai'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
-        cache_mode='none',
+        cache_mode='none',                      # file or none
         transform=signal_imger
     )
     
@@ -553,7 +561,7 @@ def train_with_config(rank, world_size, args):
         using_dataset = ['dxai'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
-        cache_mode='none',
+        cache_mode='none',                      # file or none
         transform=signal_imger
     )
     
@@ -588,14 +596,21 @@ def train_with_config(rank, world_size, args):
     device = torch.device(f"cuda:{rank}")
     
     # 모델 생성 및 DDP 설정
-    model = VITEnClassify(
+    model = VisionTransformerAE(
+        num_layers = 12,
+        num_heads = 12,
+        hidden_dim = 768,
+        mlp_dim = 3072,
+        dropout = 0.0,
+        attention_dropout  = 0.0,
+        norm_layer = partial(nn.LayerNorm, eps=1e-6),
+        image_size = 224,
+        image_channel = 4,
+        patch_size = 16,
+        masking_ratio=0.75,
         num_classes=config.num_classes,
-        image_size=config.image_size,
-        patch_size=16,
-        pretrained=config.pretrained,
-        model_size=config.model_size
     ).to(device)
-    
+
     if rank == 0:
         print(f"Creating model with {'pretrained' if config.pretrained else 'random'} initialization")
     
@@ -603,7 +618,8 @@ def train_with_config(rank, world_size, args):
     
     # 손실 함수와 옵티마이저 설정
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
+    # optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
     
     # 학습 실행
     train_model(
@@ -669,20 +685,18 @@ def parse_args():
                         help='Path to the processed data directory')
     parser.add_argument('--sweep_config', type=str, default=None,
                         help='Path to wandb sweep configuration file')
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--epochs', type=int, default=40)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--image_size', type=int, default=256)
+    parser.add_argument('--image_size', type=int, default=224)
     parser.add_argument('--num_classes', type=int, default=5)
     parser.add_argument('--window_sec', type=float, default=5.0)
     parser.add_argument('--stride_sec', type=float, default=2.0)
-    parser.add_argument('--max_order', type=float, default=10.0)
+    parser.add_argument('--max_order', type=float, default=20.0)
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--stft_mode', type=str, default='stft+cross',
                         choices=['stft', 'stft+cross', 'stft_complex'])
-    parser.add_argument('--model_size', type=str, default='b',
-                        choices=['b', 'l'])
-    parser.add_argument('--stft_nperseg', type=int, default=512,
+    parser.add_argument('--stft_nperseg', type=int, default=1024,
                         help='Length of each STFT segment')
     parser.add_argument('--stft_hop', type=int, default=256,
                         help='Number of points between successive STFT segments')
@@ -693,7 +707,7 @@ def parse_args():
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
                         help='Port for distributed training')
-    parser.add_argument('--warmup_epochs', type=int, default=100,
+    parser.add_argument('--warmup_epochs', type=int, default=1000,
                         help='epochs for reconstruction-only warm-up (classification weight=0)')
 
 
