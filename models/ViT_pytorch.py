@@ -248,7 +248,7 @@ class VisionTransformerAE(nn.Module):
         class_embedding = normal_class_embedding - current_class_embedding
         pred = self.heads(class_embedding)
         
-        return pred
+        return pred, class_embedding
 
     def random_masking(self, patch_seq):
         batch_size, seq_len, dim = patch_seq.shape
@@ -323,6 +323,22 @@ class VisionTransformerAE(nn.Module):
         loss = nn.MSELoss()(predicted_patches, target_patches)
         return loss
 
+    def get_features(self, x: torch.Tensor):
+        # 1. Image -> Patches
+        patches = self.process_input(x)
+        batch_size = patches.shape[0]
+        
+        # 2. ★★★ 위치 임베딩 ★★★
+        patches_with_pos = patches + self.pos_embedding
+        
+        # 3. Encode: class token 추가 후 unmasked patches만 인코딩
+        # class token에는 위치 정보가 필요 없습니다 (항상 첫 번째 위치).
+        class_token = self.class_token.expand(batch_size, -1, -1)
+        encoder_input = torch.cat([class_token, patches_with_pos], dim=1)
+        encoded_embedding = self.encoder(encoder_input)
+        class_embedding = encoded_embedding[:, 0]
+        
+        return class_embedding
 
 if __name__ == '__main__':
     data_root = '/Volumes/dataset_onlyMac/processed'
