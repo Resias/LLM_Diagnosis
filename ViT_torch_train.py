@@ -532,7 +532,7 @@ def train_with_config(rank, world_size, args):
     signal_imger = OrderInvariantSignalImager(
         mode=config.stft_mode,
         log1p=True,
-        normalize="none",
+        normalize="per_channel", 
         eps=1e-8,
         out_dtype=torch.float32,
         max_order=config.max_order,
@@ -692,11 +692,11 @@ def parse_args():
     parser.add_argument('--num_classes', type=int, default=5)
     parser.add_argument('--window_sec', type=float, default=5.0)
     parser.add_argument('--stride_sec', type=float, default=2.0)
-    parser.add_argument('--max_order', type=float, default=10.0)
+    parser.add_argument('--max_order', type=float, default=20.0)
     parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--stft_mode', type=str, default='stft+cross',
                         choices=['stft', 'stft+cross', 'stft_complex'])
-    parser.add_argument('--stft_nperseg', type=int, default=512,
+    parser.add_argument('--stft_nperseg', type=int, default=1024,
                         help='Length of each STFT segment')
     parser.add_argument('--stft_hop', type=int, default=256,
                         help='Number of points between successive STFT segments')
