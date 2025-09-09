@@ -94,7 +94,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             optimizer.zero_grad()
 
             reconstructed_img, _, masked_indices = net.forward_mae(img=inputs)
-            loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
+            # loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
+            loss_mae = nn.MSELoss()(reconstructed_img, inputs)
             cls_feat = net.get_features(inputs)
 
             predictions, diff_feat = net.forward_classify(current_img=inputs, normal_img=inputs_n)
@@ -250,7 +251,9 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                     inputs_n = inputs_n.to(device, non_blocking=True)
             
                 reconstructed_img, _, masked_indices = net.forward_mae(img=inputs)
-                b_loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
+                print(f"reconstructed_img: {reconstructed_img.shape}, inputs: {inputs.shape}")
+                # b_loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
+                b_loss_mae = nn.MSELoss()(reconstructed_img, inputs)
                 cls_feat = net.get_features(inputs)
 
                 predictions, diff_feat = net.forward_classify(current_img=inputs, normal_img=inputs_n)
@@ -261,7 +264,6 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
                 if is_main_process and i == 0 and wandb.run is not None:
                     # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0])
-                    rec_img = net.reconstruct(inputs[0].unsqueeze(0))
                     fig = create_reconstruction_figure(
                         orig_tensor=inputs[0],
                         rec_tensor=reconstructed_img[0],
@@ -546,7 +548,7 @@ def train_with_config(rank, world_size, args):
     # 학습용 데이터셋 생성
     train_dataset = WindowedVibrationDataset(
         data_root=data_root,
-        using_dataset = ['vat', 'vbl', 'mfd'],
+        using_dataset = ['dxai'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',                      # file or none
@@ -616,7 +618,8 @@ def train_with_config(rank, world_size, args):
     
     # 손실 함수와 옵티마이저 설정
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
+    # optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
     
     # 학습 실행
     train_model(
@@ -704,7 +707,7 @@ def parse_args():
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
                         help='Port for distributed training')
-    parser.add_argument('--warmup_epochs', type=int, default=150,
+    parser.add_argument('--warmup_epochs', type=int, default=1000,
                         help='epochs for reconstruction-only warm-up (classification weight=0)')
 
 

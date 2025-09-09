@@ -9,7 +9,7 @@ parameters:
     max: 0.001
     distribution: log_uniform_values
   epochs:
-    value: 300
+    value: 1000
   alpha:
     min: 0.2
     max: 0.8
