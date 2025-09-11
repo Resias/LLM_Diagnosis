@@ -51,7 +51,7 @@ class WindowedVibrationDataset(Dataset):
         self.class_list = ['normal', 'unbalance', 'looseness', 'misalignment', 'bearing']
         merge_map = {
             # 정상
-            'normal': 'normal',
+            'normal': 'normal(healthy)',
 
             # 언밸런스
             'unbalance': 'unbalance',
@@ -67,15 +67,15 @@ class WindowedVibrationDataset(Dataset):
             'vertical-misalignment': 'misalignment',
 
             # 베어링
-            'bpfo': 'bearing',
-            'bpfi': 'bearing',
-            'bearing': 'bearing',
-            'overhang_cage_fault': 'bearing',
-            'overhang_ball_fault': 'bearing',
-            'overhang_outer_race': 'bearing',
-            'underhang_cage_fault': 'bearing',
-            'underhang_ball_fault': 'bearing',
-            'underhang_outer_race': 'bearing',
+            'bpfo': 'bearing fault',
+            'bpfi': 'bearing fault',
+            'bearing': 'bearing fault',
+            'overhang_cage_fault': 'bearing fault',
+            'overhang_ball_fault': 'bearing fault',
+            'overhang_outer_race': 'bearing fault',
+            'underhang_cage_fault': 'bearing fault',
+            'underhang_ball_fault': 'bearing fault',
+            'underhang_outer_race': 'bearing fault',
         }
 
         # 새로운 컬럼 생성 (통합 클래스명)
