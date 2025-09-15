@@ -35,8 +35,10 @@ class WindowedVibrationDataset(Dataset):
         using_dataset = ['dxai', 'iis', 'vat', 'vbl', 'mfd'],
         drop_last=True, dtype=torch.float32, transform=None,
         channel_order=("x","y"), cache_mode="file",  # 'none' | 'file' | 'windows'
+        dict_style=False,
+        test_mode=False
     ):
-        
+        self.test_mode = test_mode
         meta_csv = os.path.join(data_root, 'meta.csv')
         meta_pd = pd.read_csv(meta_csv)
 
@@ -46,12 +48,12 @@ class WindowedVibrationDataset(Dataset):
         meta_pd['class_name'].unique()
         
         self.meta_df = meta_pd.reset_index(drop=True).copy()
-        
+        self.dict_style = dict_style
         # 클래스 통합 매핑
         self.class_list = ['normal', 'unbalance', 'looseness', 'misalignment', 'bearing']
         merge_map = {
             # 정상
-            'normal': 'normal(healthy)',
+            'normal': 'normal',
 
             # 언밸런스
             'unbalance': 'unbalance',
@@ -67,15 +69,15 @@ class WindowedVibrationDataset(Dataset):
             'vertical-misalignment': 'misalignment',
 
             # 베어링
-            'bpfo': 'bearing fault',
-            'bpfi': 'bearing fault',
-            'bearing': 'bearing fault',
-            'overhang_cage_fault': 'bearing fault',
-            'overhang_ball_fault': 'bearing fault',
-            'overhang_outer_race': 'bearing fault',
-            'underhang_cage_fault': 'bearing fault',
-            'underhang_ball_fault': 'bearing fault',
-            'underhang_outer_race': 'bearing fault',
+            'bpfo': 'bearing',
+            'bpfi': 'bearing',
+            'bearing': 'bearing',
+            'overhang_cage_fault': 'bearing',
+            'overhang_ball_fault': 'bearing',
+            'overhang_outer_race': 'bearing',
+            'underhang_cage_fault': 'bearing',
+            'underhang_ball_fault': 'bearing',
+            'underhang_outer_race': 'bearing',
         }
 
         # 새로운 컬럼 생성 (통합 클래스명)
@@ -174,6 +176,9 @@ class WindowedVibrationDataset(Dataset):
                 self._normal_pool_by_ds[key_ds] = []
             for s_n in starts_n:
                 self._normal_pool_by_ds[key_ds].append((n_row_idx, s_n))
+                
+        if self.test_mode:
+            self.index_map = self.index_map[:30]
 
     def _extract_segment(self, row_idx, start):
         """Return (seg ndarray shape (2, win_n)) for the given row & start, respecting cache_mode."""
@@ -219,7 +224,10 @@ class WindowedVibrationDataset(Dataset):
         return None
 
     def __len__(self):
-        return len(self.index_map)
+        if self.test_mode:
+            return 30
+        else:
+            return len(self.index_map)
 
     def __getitem__(self, idx, data_info=True):
         row_idx, start = self.index_map[idx]
@@ -282,7 +290,19 @@ class WindowedVibrationDataset(Dataset):
             _, _, n_info = normal_tuple
             n_kn = _build_knowledge_string(n_seg, sr=float(n_sr), rpm=float(n_row["rpm"]))
             n_info["knowledge"] = n_kn
-            return tensor_img, tensor_cls, info, normal_tuple[0], normal_tuple[1], n_info
+            
+            
+            if self.dict_style:
+                return {
+                    'current_x' : tensor_img,
+                    'current_y' : tensor_cls,
+                    'current_info' : info,
+                    'ref_x' : normal_tuple[0],
+                    'ref_y' : normal_tuple[1],
+                    'ref_info' : n_info
+                }
+            else:
+                return tensor_img, tensor_cls, info, normal_tuple[0], normal_tuple[1], n_info
         else:
             return tensor_img, tensor_cls, info
 

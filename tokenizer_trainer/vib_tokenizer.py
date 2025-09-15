@@ -1,9 +1,10 @@
 import torch.nn as nn
 
 class VibrationTokenizer(nn.Module):
-    def __init__(self, vib_encoder, token_embed_dim, freeze_encoder=True, embedding_dim=768):
+    def __init__(self, vib_ae, token_embed_dim, freeze_encoder=True, embedding_dim=768):
         super().__init__()
-        self.vib_encoder = vib_encoder
+        
+        self.vib_encoder = vib_ae
         self.device = next(self.vib_encoder.parameters()).device
         self.dtype = next(self.vib_encoder.parameters()).dtype
 
@@ -26,12 +27,8 @@ class VibrationTokenizer(nn.Module):
 
     def forward(self, x):
 
-        device = next(self.vib_encoder.parameters()).device if self.vib_encoder is not None else next(self.alignment_layer.parameters()).device
-
-        current_tensor = x.unsqueeze(0).to(device)
-
-        class_embedding = self.vib_encoder.encode(current_tensor)
+        class_embedding = self.vib_encoder.encode(x)
 
         z = self.alignment_layer(class_embedding)
 
-        return z.detach().cpu()
+        return z

@@ -15,6 +15,6 @@ checkpoints/*.pth
 cmd
 docs_eng/
 model_cache/
-*/__pycache__/
+__pycache__/
 unzipped/
 *.pt

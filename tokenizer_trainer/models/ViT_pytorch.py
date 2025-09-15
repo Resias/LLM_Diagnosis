@@ -323,7 +323,7 @@ class VisionTransformerAE(nn.Module):
         loss = nn.MSELoss()(predicted_patches, target_patches)
         return loss
 
-    def get_features(self, x: torch.Tensor):
+    def encode(self, x: torch.Tensor):
         # 1. Image -> Patches
         patches = self.process_input(x)
         batch_size = patches.shape[0]
