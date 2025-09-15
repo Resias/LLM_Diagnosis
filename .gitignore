@@ -18,3 +18,4 @@ model_cache/
 __pycache__/
 unzipped/
 *.pt
+llm_cache/

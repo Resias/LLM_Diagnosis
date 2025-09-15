@@ -1,732 +1,141 @@
-import os
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.distributed as dist
-import torch.optim as optim
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, random_split
-from torch.utils.data.distributed import DistributedSampler
-
-from functools import partial
-
-from data.dataset import WindowedVibrationDataset, OrderInvariantSignalImager
-from sklearn.metrics import precision_score, recall_score, f1_score
-from tokenizer_trainer.visualize import create_reconstruction_figure
-import matplotlib.pyplot as plt
-
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from tokenizer_trainer.models.ViT_pytorch import VisionTransformerAE
 
-import wandb
-import ast
-from tqdm import tqdm
+from data.dataset import OrderInvariantSignalImager, WindowedVibrationDataset
+
+from tokenizer_trainer.vib_tokenizer import VibrationTokenizer, VibTokeizerTrainer
+
+import lightning as L
+import os
 import argparse
-import types
+import torch
+from peft import get_peft_model, LoraConfig, TaskType
+from torch.utils.data import DataLoader
+from lightning.pytorch.loggers import WandbLogger
 
-def unwrap_ddp(model):
-    return model.module if isinstance(model, DDP) else model
-
-def _ddp_sum_tensor(t):
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    return t
-
-def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank, config):
-    net = unwrap_ddp(model)  # <-- 추가
-
-    best_val_acc = 0.0
-    is_main_process = rank == 0  # 메인 프로세스 여부 확인
-    warmup_epochs = getattr(config, "warmup_epochs", 0)   # 새 인자 사용
+if __name__ =='__main__':
+    parser = argparse.ArgumentParser(description='Vibration LLM training/evaluation script')
+    # 데이터셋 관련 옵션들
+    parser.add_argument('--data_root',   type=str, default='/Volumes/dataset_onlyMac/processed', help='llm_dataset_caching.py를 통해 만들어진 데이터 pt파일경로')
     
-    for epoch in range(num_epochs):
-        LOG_EMBED_INTERVAL = 50  # 고정 주기. 0이면 비활성화, >0이면 해당 주기마다만 로깅
-        should_log_embed = (
-            is_main_process and wandb.run is not None and
-            LOG_EMBED_INTERVAL > 0 and
-            ((epoch == 0) or ((epoch + 1) % LOG_EMBED_INTERVAL == 0))
-        )
-
-        # --- (핵심) 에폭별 α 결정: 워밍업 구간에서는 분류 손실 비중 0 ---
-        if epoch < warmup_epochs:
-            effective_alpha = 0.0
-            phase_name = "warmup"
-        else:
-            effective_alpha = float(alpha)
-            phase_name = "finetune"
-        
-        # sampler의 epoch 설정
-        if hasattr(train_loader.sampler, 'set_epoch'):
-            train_loader.sampler.set_epoch(epoch)
-        if hasattr(val_loader.sampler, 'set_epoch'):
-            val_loader.sampler.set_epoch(epoch)
-        # Training phase
-        model.train()
-        
-        if is_main_process:
-            train_iter = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}', leave=False)
-        else:
-            train_iter = train_loader
-        
-        loss_sum_local = 0.0   # sum of loss * batch_size
-        correct_local  = 0.0
-        total_local    = 0.0
-        train_preds_local = []
-        train_labels_local = []
-        embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch = [], [], [], []
-        embeds_diff_epoch = []
-        reconstruction_image_to_log = None
-        
-        # dataset에서 getitem에 인자 true로 설정해놓으면 아래와 같이 info도 같이 줌
-        for i, batch in enumerate(train_iter):
-            if len(batch) == 3:
-                inputs, labels, info = batch
-                has_pair = False
-            else:
-                inputs, labels, info, inputs_n, labels_n, info_n = batch     
-                has_pair = True
-
-            inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-            if has_pair:
-                inputs_n = inputs_n.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            reconstructed_img, _, masked_indices = net.forward_mae(img=inputs)
-            # loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
-            loss_mae = nn.MSELoss()(reconstructed_img, inputs)
-            cls_feat = net.get_features(inputs)
-
-            predictions, diff_feat = net.forward_classify(current_img=inputs, normal_img=inputs_n)
-            loss_classify = criterion(predictions, labels)
-
-            loss = effective_alpha * loss_classify + (1 - effective_alpha) * loss_mae
-        
-            loss.backward()
-            optimizer.step()
-
-            # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
-            if is_main_process and i == 0 and wandb.run is not None:
-                # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0])
-                fig = create_reconstruction_figure(
-                    orig_tensor=inputs[0],
-                    rec_tensor=reconstructed_img[0],
-                    mode=config.stft_mode,  # config에서 파라미터 가져오기
-                    max_order=config.max_order,
-                    window_sec=config.window_sec
-                )
-                # Figure를 wandb.Image 객체로 변환
-                reconstruction_image_to_log = wandb.Image(fig)
-                plt.close(fig)
-            
-            bs = labels.size(0)
-            loss_sum_local += loss.item() * bs
-            _, pred = predictions.max(1)
-            correct_local += (pred == labels).sum().item()
-            total_local += bs
-
-            train_preds_local.append(pred.detach())
-            train_labels_local.append(labels.detach())
-
-            embeds_epoch.append(cls_feat.detach().cpu())     # (B, D)
-            embeds_diff_epoch.append(diff_feat.detach().cpu())  # (B, D)
-            y_true_epoch.append(labels.detach().cpu())
-            y_pred_epoch.append(pred.detach().cpu())
-            ds_epoch.extend(list(info["dataset"]))
-
-            if is_main_process:
-                avg_loss_so_far = loss_sum_local / max(total_local, 1)
-                acc_so_far = 100.0 * correct_local / max(total_local, 1)
-                train_iter.set_postfix({
-                    'loss': f'{loss_sum_local/total_local:.4f}',
-                    'acc': f'{100.*correct_local/total_local:.2f}%'
-                })
-        
-        # reduce train metrics
-        device0 = device
-
-        train_preds_local = torch.cat(train_preds_local, dim=0)
-        train_labels_local = torch.cat(train_labels_local, dim=0)
-        tr_preds_np  = train_preds_local.detach().cpu().numpy()
-        tr_labels_np = train_labels_local.detach().cpu().numpy()
-        train_metrics = {}
-        for avg in ["micro", "macro", "weighted"]:
-            train_metrics[f"precision_{avg}"] = precision_score(tr_labels_np, tr_preds_np, average=avg, zero_division=0)
-            train_metrics[f"recall_{avg}"] = recall_score(tr_labels_np, tr_preds_np, average=avg, zero_division=0)
-            train_metrics[f"f1_{avg}"] = f1_score(tr_labels_np, tr_preds_np, average=avg, zero_division=0)
-            
-        t_train = torch.tensor([loss_sum_local, correct_local, total_local],
-                               dtype=torch.float64, device=device0)
-        _ddp_sum_tensor(t_train)
-        train_loss = (t_train[0] / t_train[2]).item() if t_train[2] > 0 else 0.0
-        train_acc  = (t_train[1] / t_train[2] * 100.0).item() if t_train[2] > 0 else 0.0
-
-        # (3) 배치들 concat
-        embeds_epoch = torch.cat(embeds_epoch, dim=0)    # (M, D)
-        embeds_diff_epoch = torch.cat(embeds_diff_epoch, dim=0)    # (M, D)
-        y_true_epoch = torch.cat(y_true_epoch, dim=0)    # (M,)
-        y_pred_epoch = torch.cat(y_pred_epoch, dim=0)    # (M,)
-        ds_epoch = np.array(ds_epoch)                    # (M,)
-        
-        project_cols = ("embedding", "pred", "label", "dataset", "split", "epoch")
-        # (5) rank0만 로깅
-        max_points = 4000
-        M = embeds_epoch.shape[0]
-        if M > max_points:
-            idx = torch.randperm(M)[:max_points]
-            embeds_s = embeds_epoch[idx]
-            embeds_diff = embeds_diff_epoch[idx]
-            ytrue_s = y_true_epoch[idx]
-            ypred_s = y_pred_epoch[idx]
-            # 리스트는 인덱싱으로 맞춰 재배치
-            idx_np = idx.cpu().numpy().tolist()
-            ds_s = [ds_epoch[i] for i in idx_np]
-        else:
-            embeds_s, embeds_diff, ytrue_s, ypred_s, ds_s = embeds_epoch, embeds_diff_epoch, y_true_epoch, y_pred_epoch, ds_epoch
-
-        if rank == 0 and wandb.run is not None:
-            # W&B Table (M rows)
-            # 권장: Table 로깅 모드 지정 (INCREMENTAL/MUTABLE/IMMUTABLE) – 최근 가이드 참고
-            # https://docs.wandb.ai/guides/models/tables/log_tables/
-            if should_log_embed:
-                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
-
-                E = embeds_s.cpu().numpy().tolist()
-                P = ypred_s.cpu().numpy().tolist()
-                Y = ytrue_s.cpu().numpy().tolist()
-
-                for i in range(len(E)):
-                    table.add_data(
-                        E[i],
-                        int(P[i]),
-                        int(Y[i]),
-                        ds_s[i],
-                        "train",
-                        int(epoch))
-                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-                # https://docs.wandb.ai/guides/track/limits/
-                wandb.log({f"embeddings/train": table, "epoch": int(epoch)})
-            
-                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
-
-                E = embeds_diff.cpu().numpy().tolist()
-                P = ypred_s.cpu().numpy().tolist()
-                Y = ytrue_s.cpu().numpy().tolist()
-
-                for i in range(len(E)):
-                    table.add_data(
-                        E[i],
-                        int(P[i]),
-                        int(Y[i]),
-                        ds_s[i],
-                        "train_diff",
-                        int(epoch))
-                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-                # https://docs.wandb.ai/guides/track/limits/
-                wandb.log({f"embeddings/train_diff": table, "epoch": int(epoch)})
-
-        # Validation phase
-        model.eval()
-        val_loss_sum_local = 0.0
-        val_correct_local  = 0.0
-        val_total_local    = 0.0
-        val_preds_local = []
-        val_labels_local = []
-
-        embeds_epoch, y_true_epoch, y_pred_epoch, ds_epoch = [], [], [], []
-        embeds_diff_epoch = []
-        val_reconstruction_image_to_log = None
-
-        with torch.no_grad():
-            for i, batch  in enumerate(val_loader):
-                if len(batch) == 3:
-                    inputs, labels, info = batch
-                    has_pair = False
-                else:
-                    inputs, labels, info, inputs_n, labels_n, info_n = batch
-                    has_pair = True
-                inputs, labels = inputs.to(device, non_blocking=True), labels.to(device, non_blocking=True)
-                if has_pair:
-                    inputs_n = inputs_n.to(device, non_blocking=True)
-            
-                reconstructed_img, _, masked_indices = net.forward_mae(img=inputs)
-                print(f"reconstructed_img: {reconstructed_img.shape}, inputs: {inputs.shape}")
-                # b_loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
-                b_loss_mae = nn.MSELoss()(reconstructed_img, inputs)
-                cls_feat = net.get_features(inputs)
-
-                predictions, diff_feat = net.forward_classify(current_img=inputs, normal_img=inputs_n)
-                b_loss_classify = criterion(predictions, labels)
-
-                b_loss = effective_alpha * b_loss_classify + (1 - effective_alpha) * b_loss_mae
-
-                # [수정] 메인 프로세스이고, 첫 번째 검증 배치일 때만 이미지 생성
-                if is_main_process and i == 0 and wandb.run is not None:
-                    # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0])
-                    fig = create_reconstruction_figure(
-                        orig_tensor=inputs[0],
-                        rec_tensor=reconstructed_img[0],
-                        mode=config.stft_mode,  # config에서 파라미터 가져오기
-                        max_order=config.max_order,
-                        window_sec=config.window_sec
-                    )
-                    # Figure를 wandb.Image 객체로 변환
-                    val_reconstruction_image_to_log = wandb.Image(fig)
-                    plt.close(fig)
-
-                bs = labels.size(0)
-                val_loss_sum_local += b_loss.item() * bs
-                _, pred = predictions.max(1)
-                val_correct_local += (pred == labels).sum().item()
-                val_total_local += bs
-                val_preds_local.append(pred.detach())
-                val_labels_local.append(labels.detach())
-                
-                embeds_epoch.append(cls_feat.detach().cpu())    # (B, D)
-                embeds_diff_epoch.append(diff_feat.detach().cpu())    # (B, D)
-                y_true_epoch.append(labels.detach().cpu())
-                y_pred_epoch.append(pred.detach().cpu())
-                ds_epoch.extend(list(info["dataset"]))
-        
-        val_preds_local = torch.cat(val_preds_local, dim=0)
-        val_labels_local = torch.cat(val_labels_local, dim=0)
-        val_preds_np = val_preds_local.detach().cpu().numpy()
-        val_labels_np = val_labels_local.detach().cpu().numpy()
-        val_metrics = {}
-        for avg in ["micro", "macro", "weighted"]:
-            val_metrics[f"precision_{avg}"] = precision_score(val_labels_np, val_preds_np, average=avg, zero_division=0)
-            val_metrics[f"recall_{avg}"] = recall_score(val_labels_np, val_preds_np, average=avg, zero_division=0)
-            val_metrics[f"f1_{avg}"] = f1_score(val_labels_np, val_preds_np, average=avg, zero_division=0)
-
-        t_val = torch.tensor([val_loss_sum_local, val_correct_local, val_total_local],
-                             dtype=torch.float64, device=device0)
-        _ddp_sum_tensor(t_val)
-        val_loss = (t_val[0] / t_val[2]).item() if t_val[2] > 0 else 0.0
-        val_acc  = (t_val[1] / t_val[2] * 100.0).item() if t_val[2] > 0 else 0.0
-
-
-        # (3) 배치들 concat
-        embeds_epoch = torch.cat(embeds_epoch, dim=0)    # (M, D)
-        embeds_diff_epoch = torch.cat(embeds_diff_epoch, dim=0)    # (M, D)
-        y_true_epoch = torch.cat(y_true_epoch, dim=0)    # (M,)
-        y_pred_epoch = torch.cat(y_pred_epoch, dim=0)    # (M,)
-        ds_epoch = np.array(ds_epoch)                    # (M,)
-        
-        project_cols = ("embedding", "pred", "label", "dataset", "split", "epoch")
-        # (5) rank0만 로깅
-        max_points = 4000
-        M = embeds_epoch.shape[0]
-        if M > max_points:
-            idx = torch.randperm(M)[:max_points]
-            embeds_s = embeds_epoch[idx]
-            embeds_diff = embeds_diff_epoch[idx]
-            ytrue_s = y_true_epoch[idx]
-            ypred_s = y_pred_epoch[idx]
-            # 리스트는 인덱싱으로 맞춰 재배치
-            idx_np = idx.cpu().numpy().tolist()
-            ds_s    = [ds_epoch[i] for i in idx_np]
-        else:
-            embeds_s, embeds_diff, ytrue_s, ypred_s, ds_s = embeds_epoch, embeds_diff_epoch, y_true_epoch, y_pred_epoch, ds_epoch
-
-        if rank == 0 and wandb.run is not None:
-            # W&B Table (M rows)
-            # 권장: Table 로깅 모드 지정 (INCREMENTAL/MUTABLE/IMMUTABLE) – 최근 가이드 참고
-            # https://docs.wandb.ai/guides/models/tables/log_tables/
-            if should_log_embed:
-                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
-
-                E = embeds_s.cpu().numpy().tolist()
-                P = ypred_s.cpu().numpy().tolist()
-                Y = ytrue_s.cpu().numpy().tolist()
-
-                for i in range(len(E)):
-                    table.add_data(
-                        E[i],
-                        int(P[i]),
-                        int(Y[i]),
-                        ds_s[i],
-                        "val",
-                        int(epoch))
-                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-                # https://docs.wandb.ai/guides/track/limits/
-                wandb.log({f"embeddings/val": table, "epoch": int(epoch)})
-                
-                table = wandb.Table(columns=list(project_cols), allow_mixed_types=True)
-
-                E = embeds_diff.cpu().numpy().tolist()
-                P = ypred_s.cpu().numpy().tolist()
-                Y = ytrue_s.cpu().numpy().tolist()
-
-                for i in range(len(E)):
-                    table.add_data(
-                        E[i],
-                        int(P[i]),
-                        int(Y[i]),
-                        ds_s[i],
-                        "val_diff",
-                        int(epoch))
-                # 한 번의 log 호출은 25MB 제한이 있으니(값 1MB 제한도 주의) 표본수를 조절
-                # https://docs.wandb.ai/guides/track/limits/
-                wandb.log({f"embeddings/val_diff": table, "epoch": int(epoch)})
-
-
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-        
-        # Log metrics to wandb
-        if is_main_process:  # 메인 프로세스에서만 로깅 및 모델 저장
-            log_dict = {
-                'epoch': epoch,
-                'train_loss': train_loss,
-                'train_acc': train_acc,
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-                "train/loss_cls": loss_classify.item(),
-                "train/loss_rec": loss_mae.item(),
-                "val/loss_cls": b_loss_classify.item(),
-                "val/loss_rec": b_loss_mae.item(),
-            }
-
-            # 🌟 [수정] 생성된 이미지가 있으면 log_dict에 추가
-            if reconstruction_image_to_log:
-                log_dict['train/reconstruction_comparison'] = reconstruction_image_to_log
-            if val_reconstruction_image_to_log:
-                log_dict['val/reconstruction_comparison'] = val_reconstruction_image_to_log
-            
-            # 🔹 sklearn PRF 추가 (있을 때만)
-            if train_metrics is not None:
-                log_dict.update({
-                    'train/precision_micro': train_metrics['precision_micro'],
-                    'train/recall_micro': train_metrics['recall_micro'],
-                    'train/f1_micro': train_metrics['f1_micro'],
-                    'train/precision_macro': train_metrics['precision_macro'],
-                    'train/recall_macro': train_metrics['recall_macro'],
-                    'train/f1_macro': train_metrics['f1_macro'],
-                    'train/precision_weighted': train_metrics['precision_weighted'],
-                    'train/recall_weighted': train_metrics['recall_weighted'],
-                    'train/f1_weighted': train_metrics['f1_weighted'],
-                })
-            if val_metrics is not None:
-                log_dict.update({
-                    'val/precision_micro': val_metrics['precision_micro'],
-                    'val/recall_micro': val_metrics['recall_micro'],
-                    'val/f1_micro': val_metrics['f1_micro'],
-                    'val/precision_macro': val_metrics['precision_macro'],
-                    'val/recall_macro': val_metrics['recall_macro'],
-                    'val/f1_macro': val_metrics['f1_macro'],
-                    'val/precision_weighted': val_metrics['precision_weighted'],
-                    'val/recall_weighted': val_metrics['recall_weighted'],
-                    'val/f1_weighted': val_metrics['f1_weighted'],
-                })
-
-            wandb.log(log_dict)
-
-            # Save best model
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                os.makedirs('checkpoints', exist_ok=True)
-                state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': state_dict,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_acc': val_acc,
-                }, os.path.join('checkpoints', 'best_model.pth'))
-                wandb.save(os.path.join('checkpoints', 'best_model.pth'))
-
-                print(f"[Epoch {epoch+1}/{num_epochs}] "
-                      f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% | "
-                      f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}%")
-        print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-
-
-
-def setup(rank, world_size, args):
-    # 환경 변수 설정
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(args.port)
+    # 캐싱 경로 옵션들
+    parser.add_argument('--model_cache',    type=str, default='./llm_cache', help='LLM 모델들을 caching해둘 경로 (TRANSFORMERS_CACHE)')
     
-    # CUDA 설정
-    torch.cuda.set_device(rank)
+    # 학습 결과물 저장 옵션들
+    parser.add_argument('--model_out',    type=str, default='./output', help='학습 결과가 저장될 디렉토리')
+    parser.add_argument('--log_dir',    type=str, default='./log_output', help='학습 결과가 저장될 디렉토리')
     
-    # 분산 처리 초기화
-    torch.distributed.init_process_group(
-        backend="nccl",
-        init_method='env://',
-        world_size=world_size,
-        rank=rank
+    # LLM 모델 관련 옵션들
+    parser.add_argument('--run_name',    type=str, default='0904', help='wandb에 저장될 run 이름')
+    parser.add_argument('--llm_model',      type=str, default='Qwen/Qwen3-4B-Instruct-2507', help='LLM Model name')
+    
+    
+    # 학습관련 옵션들
+    parser.add_argument('--pretrained_path', type=str, default='./best.pth', help='pretrained vib_AE')
+    parser.add_argument('--batch_size',    type=int, default=32, help='학습 배치사이즈')
+    parser.add_argument('--max_epochs',    type=int, default=200, help='학습 epoch')
+    args = parser.parse_args()
+    
+    
+    # 1. LLM Model Setting
+    tokenizer = AutoTokenizer.from_pretrained(args.llm_model,
+                                                cache_dir=args.model_cache)
+    llm = AutoModelForCausalLM.from_pretrained(args.llm_model, device_map="auto",
+                                            cache_dir=args.model_cache)
+    peft_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=16,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     )
-
-def cleanup():
-    torch.distributed.destroy_process_group()
-
-def train_with_config(rank, world_size, args):
-    
-    setup(rank, world_size, args)
-
-    # --- (1) 스윕 감지: 에이전트 실행 시 WANDB_SWEEP_ID 가 설정됨 ---
-    is_sweep = bool(os.environ.get("WANDB_SWEEP_ID"))
-
-    # wandb 초기화 (메인 프로세스에서만)
-    if rank == 0:
-        if is_sweep:
-            run = wandb.init(project=args.project_name, config=vars(args))
+    llm = get_peft_model(llm, peft_config)
+    llm.print_trainable_parameters()
+    special_tokens = {
+        'additional_special_tokens': ["<NORMAL_VIB_EMB>", "<CURRENT_VIB_EMB>"]
+    }
+    tokenizer.add_special_tokens(special_tokens)
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token = tokenizer.eos_token
         else:
-            # 일반 실행에서만 args를 config로 전달
-            wandb.init(project=args.project_name, config=vars(args))
-    
-    # --- (B) rank0의 config(dict) -> 모든 rank로 브로드캐스트 ---
-    if rank == 0 and wandb.run is not None:
-        # sweep일 경우 wandb.config가 최종값을 담고 있으므로 그것을 기준으로
-        cfg_dict = dict(wandb.config)
-    else:
-        # 비-rank0는 임시로 args를 dict로
-        cfg_dict = vars(args).copy()
-    
-    obj_list = [cfg_dict]
-    dist.broadcast_object_list(obj_list, src=0)   # 모든 프로세스에 동일한 설정 전달
-    cfg_dict = obj_list[0]                        # 동기화된 최종 설정
+            tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+    tokenizer.padding_side = "right"
+    llm.config.pad_token_id = tokenizer.pad_token_id
+    llm.resize_token_embeddings(len(tokenizer))
 
-    # 모든 rank에서 공통으로 사용할 네임스페이스 구성
-    config = types.SimpleNamespace(**cfg_dict)
+    # 2. Vibration Tokenizer 세팅
+    vib_ae = VisionTransformerAE(
+                                    num_classes=5,
+                                    )
+    vib_ae.load_state_dict(torch.load(args.pretrained_path))
     
-    # 1) stft_pair가 있으면 "NxM" 형식으로 파싱
-    if hasattr(config, "stft_pair") and config.stft_pair is not None:
-        n_str, h_str = str(config.stft_pair).lower().split("x")
-        config.stft_nperseg = int(n_str)
-        config.stft_hop = int(h_str)
-        if rank == 0 and wandb.run is not None:
-            wandb.config.update({
-                "stft_nperseg": config.stft_nperseg,
-                "stft_hop": config.stft_hop
-            }, allow_val_change=True)
-    else:
-        config.stft_nperseg = int(config.stft_nperseg)
-        config.stft_hop = int(config.stft_hop)
-
-    setattr(config, "stft_nperseg", config.stft_nperseg)
-    setattr(config, "stft_hop", config.stft_hop)
-
-    # W&B 설정 업데이트는 rank0에서만
-    if rank == 0 and wandb.run is not None:
-        wandb.config.update({
-            "stft_nperseg": config.stft_nperseg,
-            "stft_hop": config.stft_hop
-        }, allow_val_change=True)
-
-    torch.cuda.set_device(rank)  # 각 프로세스의 GPU 설정
-    device = torch.device(f"cuda:{rank}")
+    vib_tokenizer = VibrationTokenizer(
+                                        vib_ae=vib_ae,
+                                        token_embed_dim=int(llm.get_input_embeddings().embedding_dim),
+                                        freeze_encoder=True,
+                                    )
     
-    # 데이터 준비
-    data_root = os.path.join(os.getcwd(), config.data_root)
-    
-    # 이미지 변환기 설정 (pretrained 모델 사용 시 224x224로 강제)
-    output_size = 224 if config.pretrained else config.image_size
-    if rank == 0 and config.pretrained and config.image_size != 224:
-        print(f"Warning: Pretrained model requires 224x224 input. "
-              f"Automatically adjusting output size from {config.image_size} to 224.")
-    
+    # 3. Dataset 세팅
     signal_imger = OrderInvariantSignalImager(
-        mode=config.stft_mode,
-        log1p=True,
-        normalize="per_channel", 
-        eps=1e-8,
-        out_dtype=torch.float32,
-        max_order=config.max_order,
-        H_out=output_size,
-        W_out=output_size,
-        stft_nperseg=config.stft_nperseg,
-        stft_hop=config.stft_hop,
-        stft_window="hann",
-        stft_center=True,
-        stft_power=config.stft_power,
+                                mode='stft+cross',
+                                log1p=True,
+                                normalize= "per_channel",  
+                                eps=1e-8,
+                                out_dtype=torch.float32,
+                                max_order=20.0,           
+                                H_out=224,                
+                                W_out=224,               
+                                stft_nperseg=1024,
+                                stft_hop=256,
+                                stft_window="hann",
+                                stft_center=True,
+                                stft_power=1.0,           
+                            )
+    vib_trainset = WindowedVibrationDataset(
+                                data_root=args.data_root,
+                                using_dataset = ['vat', 'vbl', 'mfd'],
+                                window_sec=5,
+                                stride_sec=3,
+                                cache_mode='none',                      
+                                transform=signal_imger,
+                                dict_style=True,
+                                test_mode=True
+                            )
+    vib_valset = WindowedVibrationDataset(
+                                data_root=args.data_root,
+                                using_dataset = ['dxai'],
+                                window_sec=5,
+                                stride_sec=3,
+                                cache_mode='none',                      
+                                transform=signal_imger,
+                                dict_style=True,
+                                test_mode=True
+                            )
+    
+    train_loader = DataLoader(vib_trainset, batch_size=args.batch_size, shuffle=True,
+                          num_workers=os.cpu_count()//2, pin_memory=True)
+    val_loader = DataLoader(vib_valset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=os.cpu_count()//2, pin_memory=True)
+    
+    vib_tokenizer_lightning = VibTokeizerTrainer(
+        vib_tokenizer=vib_tokenizer,
+        llm=llm,
+        tokenizer=tokenizer
     )
-    
-    # 학습용 데이터셋 생성
-    train_dataset = WindowedVibrationDataset(
-        data_root=data_root,
-        using_dataset = ['dxai'],
-        window_sec=config.window_sec,
-        stride_sec=config.stride_sec,
-        cache_mode='none',                      # file or none
-        transform=signal_imger
+    wandb_logger = WandbLogger(
+        project="vibration-tokenizer",   # 프로젝트 이름 (WandB 대시보드에서 확인)
+        name=args.run_name,              # 실험 이름 (지금은 0904로 들어감)
+        save_dir=args.log_dir            # 로그 저장 경로
     )
-    
-    # 검증용 데이터셋 생성
-    val_dataset = WindowedVibrationDataset(
-        data_root=data_root,
-        using_dataset = ['dxai'],
-        window_sec=config.window_sec,
-        stride_sec=config.stride_sec,
-        cache_mode='none',                      # file or none
-        transform=signal_imger
+
+    vib_trainer = L.Trainer(
+        max_epochs=args.max_epochs,
+        logger=wandb_logger,
+        log_every_n_steps=1
     )
-    
-    # 분산 학습을 위한 sampler 생성
-    train_sampler = DistributedSampler(
-        train_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=True
+    vib_trainer.fit(
+        model = vib_tokenizer_lightning,
+        train_dataloaders=train_loader,
+        val_dataloaders=val_loader
     )
-    val_sampler = DistributedSampler(
-        val_dataset,
-        num_replicas=world_size,
-        rank=rank,
-        shuffle=False
-    )
-    
-    # 데이터로더 생성
-    train_loader = DataLoader(train_dataset, 
-                            batch_size=config.batch_size, 
-                            sampler=train_sampler,
-                            num_workers=4,
-                            pin_memory=True)
-    val_loader = DataLoader(val_dataset, 
-                          batch_size=config.batch_size, 
-                          sampler=val_sampler,
-                          num_workers=4,
-                          pin_memory=True)
-    
-    # GPU 설정
-    torch.cuda.set_device(rank)
-    device = torch.device(f"cuda:{rank}")
-    
-    # 모델 생성 및 DDP 설정
-    model = VisionTransformerAE(
-        num_layers = 12,
-        num_heads = 12,
-        hidden_dim = 768,
-        mlp_dim = 3072,
-        dropout = 0.0,
-        attention_dropout  = 0.0,
-        norm_layer = partial(nn.LayerNorm, eps=1e-6),
-        image_size = 224,
-        image_channel = 4,
-        patch_size = 16,
-        masking_ratio=0.75,
-        num_classes=config.num_classes,
-    ).to(device)
-
-    if rank == 0:
-        print(f"Creating model with {'pretrained' if config.pretrained else 'random'} initialization")
-    
-    model = DDP(model, device_ids=[rank], broadcast_buffers=False)
-    
-    # 손실 함수와 옵티마이저 설정
-    criterion = nn.CrossEntropyLoss()
-    # optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
-    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
-    
-    # 학습 실행
-    train_model(
-        alpha=config.alpha,
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        num_epochs=config.epochs,
-        device=device,
-        rank=rank,
-        config=config
-    )
-    
-    cleanup()  # process group destroy
-    if (rank == 0) and (wandb.run is not None):
-        wandb.finish()
-
-def run_training(args):
-    # 사용 가능한 GPU 수 확인
-    world_size = torch.cuda.device_count()
-    if world_size < 1:
-        raise RuntimeError("No GPUs available")
-    if world_size < 2:
-        print("Warning: Less than 2 GPUs available. Using", world_size, "GPU(s)")
-    
-    # 메인 프로세스에서 필요한 디렉토리 생성
-    os.makedirs('checkpoints', exist_ok=True)
-    
-    try:
-        mp.spawn(
-            train_with_config,
-            args=(world_size, args),
-            nprocs=world_size,
-            join=True
-        )
-    except Exception as e:
-        print(f"Error during training: {e}")
-        raise
-
-def main():
-    args = parse_args()
-    
-    # CUDA 사용 가능 여부 확인
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. This code requires GPU support.")
-    
-    # sweep 설정이 있는 경우
-    if args.sweep_config:
-        import yaml
-        with open(args.sweep_config, 'r') as f:
-            sweep_configuration = yaml.load(f, Loader=yaml.FullLoader)
-        sweep_id = wandb.sweep(sweep_configuration, project=args.project_name)
-        wandb.agent(sweep_id, function=lambda: run_training(args), count=50)
-    else:
-        # 일반 학습
-        run_training(args)
-
-def parse_args():
-    parser = argparse.ArgumentParser(description='Train ViT for Vibration Diagnosis')
-    parser.add_argument('--data_root', type=str, default='data/processed',
-                        help='Path to the processed data directory')
-    parser.add_argument('--sweep_config', type=str, default=None,
-                        help='Path to wandb sweep configuration file')
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--image_size', type=int, default=224)
-    parser.add_argument('--num_classes', type=int, default=5)
-    parser.add_argument('--window_sec', type=float, default=5.0)
-    parser.add_argument('--stride_sec', type=float, default=2.0)
-    parser.add_argument('--max_order', type=float, default=20.0)
-    parser.add_argument('--alpha', type=float, default=0.5)
-    parser.add_argument('--stft_mode', type=str, default='stft+cross',
-                        choices=['stft', 'stft+cross', 'stft_complex'])
-    parser.add_argument('--stft_nperseg', type=int, default=1024,
-                        help='Length of each STFT segment')
-    parser.add_argument('--stft_hop', type=int, default=256,
-                        help='Number of points between successive STFT segments')
-    parser.add_argument('--stft_power', type=float, default=1.0,
-                        help='Power of magnitude (1.0 for magnitude, 2.0 for power spectrum)')
-    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-recon')
-    parser.add_argument('--pretrained', type=bool, default=False,
-                        help='Use ImageNet pretrained weights for ViT')
-    parser.add_argument('--port', type=int, default=12355,
-                        help='Port for distributed training')
-    parser.add_argument('--warmup_epochs', type=int, default=1000,
-                        help='epochs for reconstruction-only warm-up (classification weight=0)')
-
-
-    return parser.parse_args()
-
-if __name__ == "__main__":
-    args = parse_args()
-    
-    # CUDA 사용 가능 여부 확인
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available. This code requires GPU support.")
-    
-    # sweep 설정이 있는 경우
-    if args.sweep_config:
-        import yaml
-        with open(args.sweep_config, 'r') as f:
-            sweep_configuration = yaml.load(f, Loader=yaml.FullLoader)
-        sweep_id = wandb.sweep(sweep_configuration, project=args.project_name)
-        wandb.agent(sweep_id, function=lambda: run_training(args), count=5)
-    else:
-        # 일반 학습
-        run_training(args)
