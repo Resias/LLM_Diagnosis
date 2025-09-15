@@ -105,9 +105,7 @@ class VibTokeizerTrainer(L.LightningModule):
                 pooled = tok_emb.mean(dim=0)      # (d,)
                 emb_list.append(pooled)
 
-        W = torch.stack(emb_list, dim=0)          # (C, d)
-        W = F.normalize(W, dim=-1)                # 미리 정규화
-        # 버퍼로 등록 → 디바이스 자동 이동 & 체크포인트 관리
+        W = torch.stack(emb_list, dim=0)          # (C, d), 원본 스케일 유지
         self.register_buffer("emb_matrix", W, persistent=False)
         self.register_buffer("logit_scale", torch.tensor(float(logit_scale_val)), persistent=False)
 
@@ -115,45 +113,55 @@ class VibTokeizerTrainer(L.LightningModule):
         x = batch['current_x']
         y = batch['current_y'].long()
 
-        z = self.vib_tokenizer(x)     # (B, d)
-        z = F.normalize(z, dim=-1)    # (B, d)
+        z = self.vib_tokenizer(x)        # (B, d)  
+        t = self.emb_matrix[y]           # (B, d)  타깃 = LLM 원본 임베딩
 
-        # 프로토타입 분류 로짓 (코사인)
-        logits = (z @ self.emb_matrix.t()) * self.logit_scale  # (B, C)
-        loss = F.cross_entropy(logits, y)
+        # 1) MSE: 좌표 그대로 맞추기
+        loss_mse = F.mse_loss(z, t)
 
-        # 로깅
+        # 2) Cosine: 방향(각도)도 맞추기
+        loss_cos = 1.0 - F.cosine_similarity(z, t, dim=-1).mean()
+
+        # 3) Norm match: 벡터 크기까지 맞추기 (LLM 분포 보정용)
+        loss_norm = F.mse_loss(z.norm(dim=-1), t.norm(dim=-1))
+
+        # 가중합 (경험상 아래 비율이 안정적)
+        loss = 0.5*loss_mse + 0.4*loss_cos + 0.1*loss_norm
+
+        # 로깅(배치 크기/분산 동기 포함)
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=x.size(0))
+        self.log("train/mse", loss_mse, on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+        self.log("train/cos_loss", loss_cos, on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+        self.log("train/norm_loss", loss_norm, on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+
+        # 참고용: 현재 코사인 유사도/노름 통계
         with torch.no_grad():
-            acc = (logits.argmax(dim=-1) == y).float().mean()
-            # 타깃과의 평균 cos sim (양성만)
-            pos_vec = self.emb_matrix[y]           # (B, d)
-            cos_sim = (z * pos_vec).sum(dim=-1).mean()
-
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/acc", acc, on_step=True, on_epoch=True, prog_bar=True)
-        self.log("train/cos_pos", cos_sim, on_step=True, on_epoch=True)
-
+            cos_sim = F.cosine_similarity(z, t, dim=-1).mean()
+            self.log("train/cos_sim", cos_sim, on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+            self.log("train/z_norm_mean", z.norm(dim=-1).mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+            self.log("train/t_norm_mean", t.norm(dim=-1).mean(), on_step=True, on_epoch=True, sync_dist=True, batch_size=x.size(0))
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x = batch['current_x']
-        y = batch['current_y'].long()
-
+        x = batch['current_x']; y = batch['current_y'].long()
         z = self.vib_tokenizer(x)
-        z = F.normalize(z, dim=-1)
+        t = self.emb_matrix[y]
 
-        logits = (z @ self.emb_matrix.t()) * self.logit_scale
-        loss = F.cross_entropy(logits, y)
+        loss_mse = F.mse_loss(z, t)
+        loss_cos = 1.0 - F.cosine_similarity(z, t, dim=-1).mean()
+        loss_norm = F.mse_loss(z.norm(dim=-1), t.norm(dim=-1))
+        loss = 0.5*loss_mse + 0.4*loss_cos + 0.1*loss_norm
+
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=x.size(0))
+        self.log("val/mse", loss_mse, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+        self.log("val/cos_loss", loss_cos, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+        self.log("val/norm_loss", loss_norm, on_epoch=True, sync_dist=True, batch_size=x.size(0))
 
         with torch.no_grad():
-            acc = (logits.argmax(dim=-1) == y).float().mean()
-            pos_vec = self.emb_matrix[y]
-            cos_sim = (z * pos_vec).sum(dim=-1).mean()
-
-        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        self.log("val/acc", acc, on_epoch=True, prog_bar=True)
-        self.log("val/cos_pos", cos_sim, on_epoch=True)
-
+            cos_sim = F.cosine_similarity(z, t, dim=-1).mean()
+            self.log("val/cos_sim", cos_sim, on_epoch=True, sync_dist=True, batch_size=x.size(0))
+            self.log("val/z_norm_mean", z.norm(dim=-1).mean(), on_epoch=True, sync_dist=True, batch_size=x.size(0))
+            self.log("val/t_norm_mean", t.norm(dim=-1).mean(), on_epoch=True, sync_dist=True, batch_size=x.size(0))
         return loss
 
     def configure_optimizers(self):

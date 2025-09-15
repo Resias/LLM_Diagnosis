@@ -13,6 +13,8 @@ from peft import get_peft_model, LoraConfig, TaskType
 from torch.utils.data import DataLoader
 from lightning.pytorch.loggers import WandbLogger
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 if __name__ =='__main__':
     parser = argparse.ArgumentParser(description='Vibration LLM training/evaluation script')
     # 데이터셋 관련 옵션들
@@ -68,7 +70,7 @@ if __name__ =='__main__':
     vib_ae = VisionTransformerAE(
                                     num_classes=5,
                                     )
-    vib_ae.load_state_dict(torch.load(args.pretrained_path))
+    # vib_ae.load_state_dict(torch.load(args.pretrained_path))
     
     vib_tokenizer = VibrationTokenizer(
                                         vib_ae=vib_ae,
