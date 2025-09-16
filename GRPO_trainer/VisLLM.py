@@ -9,8 +9,8 @@ from transformers import BitsAndBytesConfig
 import wandb
 
 from models.vit_encoder_recon import VITEnClassify
-from VisLLM.vib_grpo import CustomGRPOTRainer, reward_accuracy, reward_format
-from VisLLM.vllm_dataset import VibrationTokenizer, LLMDataset_Cache
+from GRPO_trainer.vib_grpo import CustomGRPOTRainer, reward_accuracy, reward_format
+from GRPO_trainer.vllm_dataset import VibrationTokenizer, LLMDataset_Cache
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Vibration LLM training/evaluation script')
