@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.utils.data import Subset
 import torch.optim as optim
 import torch.multiprocessing as mp
 import glob
@@ -66,12 +67,16 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         )
 
         # --- (핵심) 에폭별 α 결정: 워밍업 구간에서는 분류 손실 비중 0 ---
-        if epoch < warmup_epochs:
+        if getattr(config, "recon_only", False):
             effective_alpha = 0.0
-            phase_name = "warmup"
+            phase_name = "recon_only"
         else:
-            effective_alpha = float(alpha)
-            phase_name = "finetune"
+            if epoch < warmup_epochs:
+                effective_alpha = 0.0
+                phase_name = "warmup"
+            else:
+                effective_alpha = float(alpha)
+                phase_name = "finetune"
         
         # sampler의 epoch 설정
         if hasattr(train_loader.sampler, 'set_epoch'):
@@ -113,10 +118,10 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
             optimizer.zero_grad()
 
-            if config.reconstruct == "recon" or epoch < 750:
+            if config.reconstruct == "recon":
                 reconstructed_img = net.reconstruct(inputs)
                 loss_mae = nn.MSELoss()(reconstructed_img, inputs)
-            elif config.reconstruct == "mae" or epoch >= 750:
+            elif config.reconstruct == "mae":
                 reconstructed_img, _, masked_indices = net.forward_mae(img=inputs)
                 loss_mae = net.calculate_mae_loss(reconstructed_img, inputs, masked_indices)
             cls_feat = net.get_features(inputs)
@@ -522,6 +527,30 @@ def setup(rank, world_size, args):
 def cleanup():
     torch.distributed.destroy_process_group()
 
+def build_normal_only_subset(ds: WindowedVibrationDataset, target_class: str = "normal"):
+    is_normal_row = (ds.meta_df["merged_class"] == target_class).to_numpy()
+    keep = [i for i, (row_idx, _start) in enumerate(ds.index_map) if is_normal_row[row_idx]]
+    if not keep:
+        raise RuntimeError(f"No '{target_class}' windows found in dataset.")
+    return Subset(ds, keep)
+
+def build_normal_only_subset_ddp(ds: WindowedVibrationDataset, target_class: str = "normal", rank: int = 0):
+    if (not dist.is_available()) or (not dist.is_initialized()):
+        return build_normal_only_subset(ds, target_class)
+
+    if rank == 0:
+        subset = build_normal_only_subset(ds, target_class)
+        keep = subset.indices  # 원본 ds 기준 인덱스 리스트
+    else:
+        keep = None
+
+    obj = [keep]
+    dist.broadcast_object_list(obj, src=0)
+    keep = obj[0]
+    if keep is None or len(keep) == 0:
+        raise RuntimeError("Broadcasted normal indices are empty.")
+    return Subset(ds, keep)
+
 def train_with_config(rank, world_size, args):
     
     setup(rank, world_size, args)
@@ -611,12 +640,15 @@ def train_with_config(rank, world_size, args):
     # 학습용 데이터셋 생성
     train_dataset = WindowedVibrationDataset(
         data_root=data_root,
-        using_dataset = ['vat', 'vbl', 'mfd'],
+        using_dataset = ['dxai'],               # ['vat', 'vbl', 'mfd'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         cache_mode='none',                      # file or none
         transform=signal_imger
     )
+
+    # normal 분리 dataset
+    normal_train_subset = build_normal_only_subset_ddp(train_dataset, target_class="normal", rank=rank)
     
     # 검증용 데이터셋 생성
     val_dataset = WindowedVibrationDataset(
@@ -627,7 +659,8 @@ def train_with_config(rank, world_size, args):
         cache_mode='none',                      # file or none
         transform=signal_imger
     )
-    
+    if config.recon_only is True:
+        train_dataset = normal_train_subset
     # 분산 학습을 위한 sampler 생성
     train_sampler = DistributedSampler(
         train_dataset,
@@ -790,6 +823,8 @@ def parse_args():
     parser.add_argument('--stft_power', type=float, default=1.0,
                         help='Power of magnitude (1.0 for magnitude, 2.0 for power spectrum)')
     parser.add_argument('--project_name', type=str, default='vibration-diagnosis-recon')
+    parser.add_argument('--recon_only', action='store_true',
+                        help='Backprop on reconstruction loss only (no classifier loss)')
     parser.add_argument('--reconstruct', type=str, default='recon', choices=['recon', 'mae'])
     parser.add_argument('--resume_checkpoint', type=str, default=None,
                         help='Path to the checkpoint file to resume training from.')
