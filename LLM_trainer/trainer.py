@@ -117,7 +117,7 @@ def collate_fn(batches: list[dict], processor: MultimodalProcessor) -> dict:
             prompt_mask = token_offsets[:, 1] <= prompt_char_len
             labels[i][prompt_mask] = -100
 
-    inputs: dict[str, torch.Tensor] = {}
+    inputs: dict[str, torch.Tensor | list[str]] = {}
     for key, value in processed.items():
         if torch.is_tensor(value):
             value = value.to(device=device)
