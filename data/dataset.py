@@ -7,48 +7,45 @@ import torch
 import os
 import matplotlib.pyplot as plt
 from scipy.signal import stft, get_window
-from scipy.signal import decimate
-from scipy.stats import kurtosis
 
-def _starts_for(n, win_n, stride_n, drop_last=True):
-    if win_n <= 0 or stride_n <= 0: raise ValueError("win_n/stride_n must be > 0")
-    if n < win_n: return []
-    starts = list(range(0, n - win_n + 1, stride_n))
-    if not drop_last and (n - win_n) % stride_n != 0:
-        last_start = n - win_n
-        if not starts or starts[-1] != last_start:
-            starts.append(last_start)
-    return starts
+import argparse
 
-def rolling_windows_1d(a, win_n, stride_n):
-    # 반환: (num_windows, win_n) - zero-copy view (as_strided)
-    n = a.shape[-1]
-    num = (n - win_n) // stride_n + 1
-    if num <= 0: return np.empty((0, win_n), dtype=a.dtype)
-    shape = (num, win_n)
-    strides = (a.strides[-1] * stride_n, a.strides[-1])
-    return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
-
-class WindowedVibrationDataset(Dataset):
+"""
+Dataset Class (x_vib, x_stft, x_info, x_cls, ref_vib, ref_stft, ref_info, ref_cls 를 key로 가지는 dict를 반환)
+"""
+class VibrationDataset(Dataset):
     def __init__(
         self, data_root, window_sec, stride_sec,
         using_dataset = ['dxai', 'iis', 'vat', 'vbl', 'mfd'],
-        drop_last=True, dtype=torch.float32, transform=None,
-        channel_order=("x","y"), cache_mode="file",  # 'none' | 'file' | 'windows'
-        dict_style=False,
-        test_mode=False
+        drop_last=True, 
+        dtype=torch.float32, 
+        transform=None,
+        channel_order=("x","y"),
+        test_mode = False,
+        include_ref= True
     ):
-        self.test_mode = test_mode
-        meta_csv = os.path.join(data_root, 'meta.csv')
+        self.data_root = data_root
+        self.window_sec = window_sec
+        self.stride_sec = stride_sec
+        self.using_dataset = using_dataset
+        self.drop_last = drop_last
+        self.dtype = dtype
+        self.transform = transform
+        self.channel_order = channel_order
+        self.test_mode  = test_mode
+        self.include_ref = include_ref  
+        
+        self.load_dataset()
+    
+    def load_dataset(self):
+        meta_csv = os.path.join(self.data_root, 'meta.csv')
         meta_pd = pd.read_csv(meta_csv)
-
         meta_pd['sensor_position'] = meta_pd['sensor_position'].apply(ast.literal_eval)
         meta_pd = meta_pd[5 <= meta_pd['data_sec']]
-        meta_pd = meta_pd[meta_pd['dataset'].isin(using_dataset)]
+        meta_pd = meta_pd[meta_pd['dataset'].isin(self.using_dataset)]
         meta_pd['class_name'].unique()
-        
+        self.test_mode = self.test_mode
         self.meta_df = meta_pd.reset_index(drop=True).copy()
-        self.dict_style = dict_style
         # 클래스 통합 매핑
         self.class_list = ['normal', 'unbalance', 'looseness', 'misalignment', 'bearing']
         merge_map = {
@@ -82,25 +79,15 @@ class WindowedVibrationDataset(Dataset):
 
         # 새로운 컬럼 생성 (통합 클래스명)
         self.meta_df['merged_class'] = self.meta_df['class_name'].map(merge_map)
-        
-        
+
         if isinstance(self.meta_df.loc[0, "sensor_position"], str):
             self.meta_df["sensor_position"] = self.meta_df["sensor_position"].apply(ast.literal_eval)
-
-        self.data_root   = data_root
-        self.window_sec  = float(window_sec)
-        self.stride_sec  = float(stride_sec)
-        self.drop_last   = drop_last
-        self.dtype       = dtype
-        self.transform   = transform
-        self.channel_order = channel_order
-        self.cache_mode  = cache_mode
 
         self.index_map = []      # (row_idx, start)
         self._row_meta = {}      # per-row meta
         self._file_cache = {}    # cache_mode in ('file','windows'): row_idx -> np.ndarray or dict
         self._win_cache  = {}    # cache_mode == 'windows': row_idx -> (W, 2, win_n)
-        self.include_normal_ref = True  # always return a normal-reference sample from the same dataset & load_condition
+
 
         # 인덱스/캐시 준비
         print('caching dataset ... ')
@@ -115,11 +102,11 @@ class WindowedVibrationDataset(Dataset):
             else:
                 x_idx = sensor_pos.index("motor_x"); y_idx = sensor_pos.index("motor_y")
 
-            arr = np.load(file_path, mmap_mode=("r" if self.cache_mode=="none" else None))
+            arr = np.load(file_path, mmap_mode=(None))
             n_samples = arr.shape[1]
             win_n   = int(round(self.window_sec * sr))
             stride_n= int(round(self.stride_sec * sr))
-            starts  = _starts_for(n_samples, win_n, stride_n, self.drop_last)
+            starts  = starts_for(n_samples, win_n, stride_n, self.drop_last)
 
             self._row_meta[row_idx] = {
                 "file_path": file_path, "sr": sr,
@@ -128,54 +115,41 @@ class WindowedVibrationDataset(Dataset):
             for s in starts:
                 self.index_map.append((row_idx, s))
 
-            if self.cache_mode == "file":
-                # 파일을 RAM로딩 (한 번만)
-                if row_idx not in self._file_cache:
-                    self._file_cache[row_idx] = np.load(file_path)  # (S, N), ndarray in RAM
-            elif self.cache_mode == "windows":
-                # 윈도우까지 프리컴퓨트 (최고속도/메모리 多)
-                base = np.load(file_path)  # (S, N) in RAM
-                x = base[x_idx]; y = base[y_idx]
-                xw = rolling_windows_1d(x, win_n, stride_n)  # (W, win_n) - view
-                yw = rolling_windows_1d(y, win_n, stride_n)
-                # 채널 스택 (W, 2, win_n)
-                if channel_order == ("x","y"):
-                    win = np.stack([xw, yw], axis=1)
-                else:
-                    win = np.stack([yw, xw], axis=1)
-                # as_strided view라 학습 중 쓰기 방지 위해 copy 권장
-                self._win_cache[row_idx] = win.copy()
+            if row_idx not in self._file_cache:
+                self._file_cache[row_idx] = np.load(file_path)  # (S, N), ndarray in RAM
+            
 
         # ---- Build normal-reference window pool: key = (dataset, load_condition) ----
-        self._normal_pool = {}  # (dataset, load_condition) -> list of (row_idx, start)
+        self._ref_pool = {}  # (dataset, load_condition) -> list of (row_idx, start)
         for n_row_idx, n_row in self.meta_df.iterrows():
             if self.meta_df.loc[n_row_idx, 'merged_class'] != 'normal':
                 continue
             sr_n = float(n_row["sampling_rate"])
             win_n_n = int(round(self.window_sec * sr_n))
             stride_n_n = int(round(self.stride_sec * sr_n))
-            starts_n = _starts_for(np.load(os.path.join(self.data_root, n_row["file_name"])).shape[1],
-                                   win_n_n, stride_n_n, self.drop_last)
+            starts_n = starts_for(np.load(os.path.join(self.data_root, n_row["file_name"])).shape[1],
+                                win_n_n, stride_n_n, self.drop_last)
             key = (n_row["dataset"], n_row["load_condition"])
-            if key not in self._normal_pool:
-                self._normal_pool[key] = []
+            if key not in self._ref_pool:
+                self._ref_pool[key] = []
             for s_n in starts_n:
-                self._normal_pool[key].append((n_row_idx, s_n))
+                self._ref_pool[key].append((n_row_idx, s_n))
+                
         # fallback pool by dataset only (if no matching load_condition exists)
-        self._normal_pool_by_ds = {}
+        self._ref_pool_by_ds = {}
         for n_row_idx, n_row in self.meta_df.iterrows():
             if self.meta_df.loc[n_row_idx, 'merged_class'] != 'normal':
                 continue
             sr_n = float(n_row["sampling_rate"])
             win_n_n = int(round(self.window_sec * sr_n))
             stride_n_n = int(round(self.stride_sec * sr_n))
-            starts_n = _starts_for(np.load(os.path.join(self.data_root, n_row["file_name"])).shape[1],
-                                   win_n_n, stride_n_n, self.drop_last)
+            starts_n = starts_for(np.load(os.path.join(self.data_root, n_row["file_name"])).shape[1],
+                                win_n_n, stride_n_n, self.drop_last)
             key_ds = (n_row["dataset"],)
-            if key_ds not in self._normal_pool_by_ds:
-                self._normal_pool_by_ds[key_ds] = []
+            if key_ds not in self._ref_pool_by_ds:
+                self._ref_pool_by_ds[key_ds] = []
             for s_n in starts_n:
-                self._normal_pool_by_ds[key_ds].append((n_row_idx, s_n))
+                self._ref_pool_by_ds[key_ds].append((n_row_idx, s_n))
                 
         if self.test_mode:
             self.index_map = self.index_map[:30]
@@ -185,39 +159,26 @@ class WindowedVibrationDataset(Dataset):
         row = self.meta_df.iloc[row_idx]
         meta = self._row_meta[row_idx]
         sr, x_idx, y_idx, win_n = meta["sr"], meta["x_idx"], meta["y_idx"], meta["win_n"]
-        if self.cache_mode == "none":
-            arr = np.load(meta["file_path"], mmap_mode="r")
-            x_seg = arr[x_idx, start:start+win_n]
-            y_seg = arr[y_idx, start:start+win_n]
-        elif self.cache_mode == "file":
-            base = self._file_cache[row_idx]
-            x_seg = base[x_idx, start:start+win_n]
-            y_seg = base[y_idx, start:start+win_n]
-        else:  # 'windows'
-            stride_n = int(round(self.stride_sec * sr))
-            widx = (start // stride_n)
-            win = self._win_cache[row_idx]  # (W, 2, win_n)
-            seg = win[widx]
-            # ensure correct channel order
-            if self.channel_order == ("x","y"):
-                return seg
-            else:
-                return seg[::-1]
+
+        base = self._file_cache[row_idx]
+        x_seg = base[x_idx, start:start+win_n]
+        y_seg = base[y_idx, start:start+win_n]
+
         seg = np.stack([x_seg, y_seg], axis=0) if self.channel_order==("x","y") \
               else np.stack([y_seg, x_seg], axis=0)
         return seg
 
-    def _pick_normal_reference(self, dataset, load_condition):
+    def _pick_ref_reference(self, dataset, load_condition):
         """Return (row_idx, start) of a normal sample matching (dataset, load_condition) if available,
         otherwise same dataset only, otherwise None."""
         key = (dataset, load_condition)
-        pool = self._normal_pool.get(key)
+        pool = self._ref_pool.get(key)
         if pool:
             ridx, s = pool[np.random.randint(len(pool))]
             return ridx, s
         # fallback by dataset only
         key_ds = (dataset,)
-        pool2 = self._normal_pool_by_ds.get(key_ds)
+        pool2 = self._ref_pool_by_ds.get(key_ds)
         if pool2:
             ridx, s = pool2[np.random.randint(len(pool2))]
             return ridx, s
@@ -229,19 +190,19 @@ class WindowedVibrationDataset(Dataset):
         else:
             return len(self.index_map)
 
-    def __getitem__(self, idx, data_info=True):
+    def __getitem__(self, idx):
         row_idx, start = self.index_map[idx]
         row = self.meta_df.iloc[row_idx]
         meta = self._row_meta[row_idx]
         sr = meta["sr"]
 
         # ---- current segment ----
-        seg = self._extract_segment(row_idx, start)
-        tensor_img = self.transform(seg, sr=sr, rpm=float(row["rpm"]))
+        x_vib = self._extract_segment(row_idx, start)
+        x_stft = self.transform(x_vib, sr=sr, rpm=float(row["rpm"]))
         class_idx = self.class_list.index(row['merged_class'])
-        tensor_cls = torch.tensor(class_idx ,dtype=torch.long)
+        x_cls = torch.tensor(class_idx ,dtype=torch.long)
 
-        info = {
+        x_info = {
             "sampling_rate": float(sr),
             "rpm": float(row["rpm"]),
             "label_class": str(row["class_name"]),
@@ -251,60 +212,70 @@ class WindowedVibrationDataset(Dataset):
             "dataset": str(row["dataset"]),
             "file_name": str(row["file_name"]),
         }
+        
+        data_dict = {
+                'x_vib' : x_vib, 
+                'x_stft' : x_stft,
+                'x_cls' : x_cls,
+                'x_info' : x_info
+            }
 
         # ---- normal reference (same dataset & load_condition) ----
-        normal_tuple = None
-        if self.include_normal_ref:
-            pick = self._pick_normal_reference(row["dataset"], row["load_condition"])
+        
+        if self.include_ref:
+            pick = self._pick_ref_reference(row["dataset"], row["load_condition"])
             if pick is not None:
-                n_row_idx, n_start = pick
-                n_row = self.meta_df.iloc[n_row_idx]
-                n_meta = self._row_meta[n_row_idx]
-                n_sr = n_meta["sr"]
-                n_seg = self._extract_segment(n_row_idx, n_start)
-                tensor_img_norm = self.transform(n_seg, sr=n_sr, rpm=float(n_row["rpm"]))
+                ref_row_idx, ref_start = pick
+                ref_row = self.meta_df.iloc[ref_row_idx]
+                ref_meta = self._row_meta[ref_row_idx]
+                ref_sr = ref_meta["sr"]
+                
+                ref_vib = self._extract_segment(ref_row_idx, ref_start)
+                ref_stft = self.transform(ref_vib, sr=ref_sr, rpm=float(ref_row["rpm"]))
                 tensor_cls_norm = torch.tensor(self.class_list.index('normal'), dtype=torch.long)
-                n_info = {
-                    "sampling_rate": float(n_sr),
-                    "rpm": float(n_row["rpm"]),
-                    "label_class": str(n_row["class_name"]),
-                    "merged_class": str(n_row["merged_class"]),
-                    "severity": str(n_row["severity"]),
-                    "load_condition": str(n_row["load_condition"]),
-                    "dataset": str(n_row["dataset"]),
-                    "file_name": str(n_row["file_name"]),
+                ref_info = {
+                    "sampling_rate": float(ref_sr),
+                    "rpm": float(ref_row["rpm"]),
+                    "label_class": str(ref_row["class_name"]),
+                    "merged_class": str(ref_row["merged_class"]),
+                    "severity": str(ref_row["severity"]),
+                    "load_condition": str(ref_row["load_condition"]),
+                    "dataset": str(ref_row["dataset"]),
+                    "file_name": str(ref_row["file_name"]),
                 }
-                normal_tuple = (tensor_img_norm, tensor_cls_norm, n_info)
-
-        if not data_info:
-            if normal_tuple is None:
-                return tensor_img, tensor_cls
-            else:
-                tensor_img_norm, tensor_cls_norm, _ = normal_tuple
-                return tensor_img, tensor_cls, tensor_img_norm, tensor_cls_norm
-
-        # ---- knowledge strings when data_info=True ----
-        cur_kn = _build_knowledge_string(seg, sr=float(sr), rpm=float(row["rpm"]))
-        info["knowledge"] = cur_kn
-        if normal_tuple is not None:
-            _, _, n_info = normal_tuple
-            n_kn = _build_knowledge_string(n_seg, sr=float(n_sr), rpm=float(n_row["rpm"]))
-            n_info["knowledge"] = n_kn
+                ref_dict = {
+                            'ref_vib' : ref_vib,
+                            'ref_stft' : ref_stft, 
+                            'ref_cls' : tensor_cls_norm, 
+                            'ref_info' : ref_info}
+                
+            data_dict.update(ref_dict)
             
-            
-            if self.dict_style:
-                return {
-                    'current_x' : tensor_img,
-                    'current_y' : tensor_cls,
-                    'current_info' : info,
-                    'ref_x' : normal_tuple[0],
-                    'ref_y' : normal_tuple[1],
-                    'ref_info' : n_info
-                }
-            else:
-                return tensor_img, tensor_cls, info, normal_tuple[0], normal_tuple[1], n_info
-        else:
-            return tensor_img, tensor_cls, info
+        return data_dict
+    
+
+def starts_for(n, win_n, stride_n, drop_last=True):
+    if win_n <= 0 or stride_n <= 0: raise ValueError("win_n/stride_n must be > 0")
+    if n < win_n: return []
+    starts = list(range(0, n - win_n + 1, stride_n))
+    if not drop_last and (n - win_n) % stride_n != 0:
+        last_start = n - win_n
+        if not starts or starts[-1] != last_start:
+            starts.append(last_start)
+    return starts
+
+def rolling_windows_1d(a, win_n, stride_n):
+    # 반환: (num_windows, win_n) - zero-copy view (as_strided)
+    n = a.shape[-1]
+    num = (n - win_n) // stride_n + 1
+    if num <= 0: return np.empty((0, win_n), dtype=a.dtype)
+    shape = (num, win_n)
+    strides = (a.strides[-1] * stride_n, a.strides[-1])
+    return np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
+
+"""
+STFT + Cross Mag, Cross Phase 를 수행하는 Transform
+"""
 
 class OrderInvariantSignalImager:
     """
@@ -586,124 +557,54 @@ def visualize_imaging_tensor(
         os.makedirs(save_path, exist_ok=True)
         fig.savefig(save_path, dpi=150)
     plt.close(fig) if save_path else plt.show()
-
-# ---- Helper for knowledge string ----
-def _dominant_order_peaks(seg, sr, rpm, k=3, tol=0.15, ds_factor=4, seg_factor=4, sec_win=1.0):
-    """
-    Compute dominant spectral peaks using ensemble averaging to reduce noise.
-    Steps:
-      1) Optional downsampling by ds_factor (default 4).
-      2) Split the signal into `seg_factor` contiguous segments (default 4).
-      3) Within each segment, cut into non-overlapping windows of `sec_win` seconds (default 1.0s).
-      4) Compute Hann-windowed rFFT magnitude of each window and average across all windows.
-      5) Return top-k peak frequencies and their proximity to 1x/2x/3x orders.
-
-    Returns: dict with
-      - peaks_hz: list of top-k peak frequencies (Hz)
-      - orders: list of their order values (peak_hz / f_rot)
-      - near_1x / near_2x / near_3x: boolean flags
-    """
-    x = np.asarray(seg[0], dtype=float)
-    if x.size == 0 or sr <= 0 or rpm <= 0:
-        return {"peaks_hz": [], "orders": [], "near_1x": False, "near_2x": False, "near_3x": False}
-
-    # 1) Downsample (zero-phase IIR decimation to suppress aliasing)
-    sr_eff = float(sr)
-    if ds_factor and ds_factor > 1:
-        try:
-            x = decimate(x, ds_factor, ftype='iir', zero_phase=True)
-            sr_eff = sr_eff / ds_factor
-        except Exception:
-            # Fallback: naive decimation if scipy version lacks zero_phase
-            x = x[::ds_factor]
-            sr_eff = sr_eff / ds_factor
-
-    n_total = x.shape[0]
-    if n_total < int(sec_win * sr_eff):
-        # Not enough samples for a 1-second window; fall back to plain rFFT
-        freqs = np.fft.rfftfreq(n_total, d=1.0/sr_eff)
-        mag = np.abs(np.fft.rfft(x))
-        if mag.size > 0:
-            mag[0] = 0.0
-    else:
-        # 2) Split into seg_factor segments
-        seg_factor = max(1, int(seg_factor))
-        seg_len = n_total // seg_factor
-        window_n = int(round(sec_win * sr_eff))
-        if window_n <= 0: window_n = min(n_total, 1024)
-
-        # 3) Within each segment, cut into non-overlapping 1s windows and accumulate spectra
-        acc_mag = None
-        count = 0
-        hann = np.hanning(window_n)
-        for s in range(seg_factor):
-            start = s * seg_len
-            end = start + seg_len if s < seg_factor - 1 else n_total
-            seg_x = x[start:end]
-            m = seg_x.shape[0] // window_n
-            for i in range(m):
-                w = seg_x[i*window_n:(i+1)*window_n]
-                w = w - np.mean(w)
-                W = np.fft.rfft(w * hann)
-                mag_w = np.abs(W)
-                if acc_mag is None:
-                    acc_mag = mag_w
-                else:
-                    # Align length in case of minor rounding differences
-                    L = min(acc_mag.shape[0], mag_w.shape[0])
-                    acc_mag = acc_mag[:L] + mag_w[:L]
-                count += 1
-        if count == 0:
-            # Fallback to whole-signal FFT
-            freqs = np.fft.rfftfreq(n_total, d=1.0/sr_eff)
-            mag = np.abs(np.fft.rfft(x))
-        else:
-            mag = acc_mag / float(count)
-            freqs = np.fft.rfftfreq(window_n, d=1.0/sr_eff)
-        if mag.size > 0:
-            mag[0] = 0.0
-
-    # 4) Pick top-k peaks by magnitude
-    if mag.size == 0:
-        return {"peaks_hz": [], "orders": [], "near_1x": False, "near_2x": False, "near_3x": False}
-    k = max(1, int(k))
-    idx = np.argsort(mag)[-k:]
-    idx = idx[np.argsort(freqs[idx])]
-    peaks_hz = freqs[idx].tolist()
-
-    # 5) Map to orders and proximity checks
-    f_rot = rpm / 60.0
-    orders = [p / f_rot if f_rot > 0 else 0.0 for p in peaks_hz]
-    def near(o, target): return abs(o - target) <= tol
-    near_flags = {
-        "near_1x": any(near(o, 1.0) for o in orders),
-        "near_2x": any(near(o, 2.0) for o in orders),
-        "near_3x": any(near(o, 3.0) for o in orders),
-    }
-    return {"peaks_hz": [float(p) for p in peaks_hz], "orders": [float(o) for o in orders], **near_flags}
-
-def _build_knowledge_string(seg, sr, rpm):
-    """
-    Build a compact textual summary for RAG/LLM reasoning from a window segment.
-    Includes RMS, kurtosis, crest factor, and dominant order peaks proximity.
-    """
-    x = seg[0]; y = seg[1]
-    def _rms(a): return float(np.sqrt(np.mean(a**2) + 1e-12))
-    def _crest(a):
-        r = _rms(a)
-        return float((np.max(np.abs(a)) / (r + 1e-12)) if r > 0 else 0.0)
-    rms_x, rms_y = _rms(x), _rms(y)
-    k_x = float(kurtosis(x, fisher=False, bias=False)) if x.size > 8 else 3.0
-    k_y = float(kurtosis(y, fisher=False, bias=False)) if y.size > 8 else 3.0
-    cf_x, cf_y = _crest(x), _crest(y)
-    dom = _dominant_order_peaks(seg, sr, rpm, k=5, ds_factor=4, seg_factor=4, sec_win=1.0)
-    parts = [
-        f"sr={sr:.1f}Hz, rpm={rpm:.1f}, f_rot={rpm/60.0:.3f}Hz",
-        f"RMS(x,y)=({rms_x:.4g},{rms_y:.4g})",
-        f"Kurtosis(x,y)=({k_x:.3g},{k_y:.3g})",
-        f"CrestFactor(x,y)=({cf_x:.3g},{cf_y:.3g})",
-        f"TopPeaksHz={','.join(f'{p:.2f}' for p in dom['peaks_hz'])}",
-        f"Orders={','.join(f'{o:.2f}' for o in dom['orders'])}",
-        f"near(1x)={dom['near_1x']}, near(2x)={dom['near_2x']}, near(3x)={dom['near_3x']}",
-    ]
-    return " | ".join(parts)
+    
+    
+if __name__ == '__main__':
+    
+    parser = argparse.ArgumentParser(description='Vibration LLM training/evaluation script')
+    parser.add_argument('--data_root',   type=str, default='/Volumes/dataset_onlyMac/processed', help='llm_dataset_caching.py를 통해 만들어진 데이터 pt파일경로')
+    parser.add_argument('--batch_size',    type=int, default=32, help='학습 배치사이즈')
+    args = parser.parse_args()
+    
+    signal_imger = OrderInvariantSignalImager(
+                                mode='stft+cross',
+                                log1p=True,
+                                normalize= "per_channel",  
+                                eps=1e-8,
+                                out_dtype=torch.float32,
+                                max_order=20.0,           
+                                H_out=224,                
+                                W_out=224,               
+                                stft_nperseg=1024,
+                                stft_hop=256,
+                                stft_window="hann",
+                                stft_center=True,
+                                stft_power=1.0,           
+                            )
+    vib_trainset = VibrationDataset(
+                                data_root=args.data_root,
+                                using_dataset = ['vat', 'vbl', 'mfd'],
+                                window_sec=5,
+                                stride_sec=3,            
+                                transform=signal_imger,
+                            )
+    vib_valset = VibrationDataset(
+                                data_root=args.data_root,
+                                using_dataset = ['dxai'],
+                                window_sec=5,
+                                stride_sec=3,             
+                                transform=signal_imger,
+                            )
+    
+    data_dict = vib_trainset[0]
+    for k in data_dict.keys():
+        print(f'\nkey : {k}')
+        print(f'item : {data_dict[k]}')
+        print(f'type : {type(data_dict[k])}\n')
+    
+    print('Train Set Testing')
+    for data_sample in tqdm(vib_trainset):
+        continue
+    print('Validation Set Testing')
+    for data_sample in tqdm(vib_valset):
+        continue
