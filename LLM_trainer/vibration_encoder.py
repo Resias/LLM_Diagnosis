@@ -30,7 +30,8 @@ from cornstarch.models.multimodal_language_model import (
 from cornstarch.models.multimodal_language_model.processing_multimodal_language_model import (
     MultimodalProcessor,
 )
-
+import sys, os
+sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
 from tokenizer_trainer.models.ViT_pytorch import VisionTransformerAE
 
 
@@ -149,9 +150,13 @@ def build_stft_projector(embedding_dim: int, token_embed_dim: int) -> Multimodal
     )
     return MultimodalProjector(config=proj_cfg, projection=projection)
 
-def build_stft_module(modality_key: str, llm_hidden_size: int) -> ModalEncoderModule:
+def build_stft_module(modality_key: str, llm_hidden_size: int, vib_enc_pth:str) -> ModalEncoderModule:
     embedding_dim = 768
-    pretrained_ae = VisionTransformerAE(num_classes=5)
+    ae = VisionTransformerAE(num_classes=5)
+    """
+    여기에 승하가 pretrain_ae로 가중치를 로드하는 내용을 넣어주어야 함
+    """
+    pretrained_ae = ae.load_state_dict(vib_enc_pth)
     vib_cfg = VibrationEncoderConfig(
         input_channels=2,
         input_length=224,

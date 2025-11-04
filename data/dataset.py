@@ -558,7 +558,43 @@ def visualize_imaging_tensor(
         fig.savefig(save_path, dpi=150)
     plt.close(fig) if save_path else plt.show()
     
+
+
+def get_dataset(args,
+                train_domain=['vat', 'vbl', 'mfd'],
+                valid_domain=['dxai']):
+    signal_imger = OrderInvariantSignalImager(
+                                mode='stft+cross',
+                                log1p=True,
+                                normalize= "per_channel",  
+                                eps=1e-8,
+                                out_dtype=torch.float32,
+                                max_order=20.0,           
+                                H_out=224,                
+                                W_out=224,               
+                                stft_nperseg=1024,
+                                stft_hop=256,
+                                stft_window="hann",
+                                stft_center=True,
+                                stft_power=1.0,           
+                            )
+    vib_trainset = VibrationDataset(
+                                data_root=args.data_root,
+                                using_dataset = train_domain,
+                                window_sec=5,
+                                stride_sec=3,            
+                                transform=signal_imger,
+                            )
+    vib_valset = VibrationDataset(
+                                data_root=args.data_root,
+                                using_dataset = valid_domain,
+                                window_sec=5,
+                                stride_sec=3,             
+                                transform=signal_imger,
+                            )
     
+    return vib_trainset, vib_valset
+
 if __name__ == '__main__':
     
     parser = argparse.ArgumentParser(description='Vibration LLM training/evaluation script')

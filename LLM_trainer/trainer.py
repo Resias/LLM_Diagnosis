@@ -31,9 +31,7 @@ from cornstarch.models.multimodal_language_model.processing_multimodal_language_
     MultimodalProcessor,
 )
 
-from vibration_encdoer import build_stft_module, STFTProcessor, stft_num_features
-
-from tokenizer_trainer.models.ViT_pytorch import VisionTransformerAE
+from LLM_Diagnosis.LLM_trainer.vibration_encoder import build_stft_module, STFTProcessor, stft_num_features
 
 
 MODALITY_KEYS: tuple[str, str] = ("x_stft", "ref_stft")
@@ -67,7 +65,8 @@ def patch_llm_forward(llm: PreTrainedModel) -> None:
 def build_multimodal_system(
         apply_lora: bool = True,
         cache_dir: str = "/workspace/llm_cache",
-        llm_name: str = "Qwen/Qwen3-4B-Instruct-2507"
+        llm_name: str = "Qwen/Qwen3-4B-Instruct-2507",
+        vib_enc_pth:str = ''
     ) -> tuple[MultimodalModel, AutoTokenizer, MultimodalProcessor]:
     gpu_available = torch.cuda.is_available()
     if gpu_available and torch.cuda.is_bf16_supported():
@@ -92,7 +91,9 @@ def build_multimodal_system(
         tokenizer.add_special_tokens({"pad_token": "<pad>"})
     tokenizer.add_special_tokens({"additional_special_tokens": MODALITY_TOKENS})
 
-    encoder_modules = {key: build_stft_module(key, llm.config.hidden_size) for key in MODALITY_KEYS}
+    encoder_modules = {key: build_stft_module(modality_key=key, 
+                                              llm_hidden_size=llm.config.hidden_size, 
+                                              vib_enc_pth=vib_enc_pth) for key in MODALITY_KEYS}
 
     if apply_lora:
         peft_config = LoraConfig(

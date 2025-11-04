@@ -44,3 +44,12 @@ class LLM_Dataset(Dataset):
         }
         
         return data_dict.update(llm_data_dict)
+    
+def get_llm_dataset(train_dataset, val_dataset):
+    train_llm_dataset = LLM_Dataset(
+        vibration_dataset=train_dataset
+    )
+    val_llm_dataset = LLM_Dataset(
+        vibration_dataset=val_dataset
+    )
+    return train_llm_dataset, val_llm_dataset
