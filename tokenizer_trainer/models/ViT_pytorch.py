@@ -5,7 +5,7 @@ from functools import partial
 import torch.nn as nn
 from torchvision.models.vision_transformer import EncoderBlock
 
-from data.dataset import OrderInvariantSignalImager, WindowedVibrationDataset
+from data.dataset import OrderInvariantSignalImager, VibrationDataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -323,7 +323,7 @@ class VisionTransformerAE(nn.Module):
         loss = nn.MSELoss()(predicted_patches, target_patches)
         return loss
 
-    def get_features(self, x: torch.Tensor):
+    def encode(self, x: torch.Tensor):
         # 1. Image -> Patches
         patches = self.process_input(x)
         batch_size = patches.shape[0]
@@ -361,7 +361,7 @@ if __name__ == '__main__':
             stft_power=1.0,           # 1: magnitude, 2: power
         )
     dataset_names = ['dxai', 'mfd','vat','vbl']
-    total_dataset = WindowedVibrationDataset(
+    total_dataset = VibrationDataset(
         data_root=data_root,
         using_dataset=dataset_names,
         window_sec=5,
