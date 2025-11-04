@@ -18,5 +18,6 @@ model_cache/
 __pycache__/
 unzipped/
 *.pt
+ReconTuning/
 llm_cache/
 reference.py
