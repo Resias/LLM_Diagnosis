@@ -68,7 +68,9 @@ if __name__ =='__main__':
 
     # 2. Vibration Tokenizer 세팅
     vib_ae = VisionTransformerAE(num_classes=5,)
-    # vib_ae.load_state_dict(torch.load(args.pretrained_path))
+    payload = torch.load(args.pretrained_path)
+    state_dict = payload.get('model_state_dict', payload)
+    vib_ae.load_state_dict(state_dict)
     
     vib_tokenizer = VibrationTokenizer(
                                         vib_ae=vib_ae,
@@ -98,7 +100,7 @@ if __name__ =='__main__':
                                 window_sec=5,
                                 stride_sec=3,
                                 transform=signal_imger,
-                                test_mode=True
+                                test_mode=False
                             )
     vib_valset = VibrationDataset(
                                 data_root=args.data_root,
@@ -106,7 +108,7 @@ if __name__ =='__main__':
                                 window_sec=5,
                                 stride_sec=3,
                                 transform=signal_imger,
-                                test_mode=True
+                                test_mode=False
                             )
     
     train_loader = DataLoader(vib_trainset, batch_size=args.batch_size, shuffle=True,
