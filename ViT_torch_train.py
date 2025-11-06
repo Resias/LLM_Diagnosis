@@ -1,3 +1,4 @@
+from datetime import datetime
 import os
 import pandas as pd
 import numpy as np
@@ -154,10 +155,10 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
     autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
     
     # 로깅 주기/용량 제한
-    IMG_LOG_EVERY = 100    # epoch 주기
-    EMB_LOG_EVERY = 100   # epoch 주기
-    EMB_PER_RANK  = 32    # 배치에서 임의 샘플
-    TABLE_MAX_ROWS = 200  # W&B table 행수 제한
+    IMG_LOG_EVERY = getattr(config, "img_log_every", 100)
+    EMB_LOG_EVERY = getattr(config, "emb_log_every", 100)
+    EMB_PER_RANK  = getattr(config, "emb_per_rank", 32)
+    TABLE_MAX_ROWS = getattr(config, "table_max_rows", 200)
     
     for epoch in range(num_epochs):
         effective_alpha = 0.0 if epoch < warmup_epochs else float(alpha)
@@ -174,8 +175,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False) if is_main else train_loader
 
         loss_sum_local = 0.0
-        correct_local  = 0.0
-        total_local    = 0.0
+        correct_local = 0.0
+        total_local = 0.0
         train_preds_local = []
         train_labels_local = []
 
@@ -238,12 +239,10 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         # reduce train metrics
         device0 = device
 
-        # reduce train scalars
-        device0 = device
         t_train = torch.tensor([loss_sum_local, correct_local, total_local], dtype=torch.float64, device=device0)
         _ddp_sum_tensor(t_train)
         train_loss = (t_train[0] / t_train[2]).item() if t_train[2] > 0 else 0.0
-        train_acc  = (t_train[1] / t_train[2] * 100.0).item() if t_train[2] > 0 else 0.0
+        train_acc = (t_train[1] / t_train[2] * 100.0).item() if t_train[2] > 0 else 0.0
 
         # sklearn metrics (rank별 로컬; 보고용)
         train_preds_local = torch.cat(train_preds_local, dim=0).detach().cpu().numpy()
@@ -274,8 +273,10 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         last_val_y = None
         first_val_image_logged = False
 
+        val_iter = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False) if is_main else val_loader
+
         with torch.no_grad():
-            for i, batch  in enumerate(val_loader):
+            for i, batch  in enumerate(val_iter):
                 x = batch['x_stft'].to(device, non_blocking=True)
                 y = batch['x_cls'].to(device, non_blocking=True)
                 ref_x = batch['ref_stft'].to(device, non_blocking=True)
@@ -430,9 +431,6 @@ def setup(rank, world_size, args):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(args.port)
     
-    # CUDA 설정
-    torch.cuda.set_device(rank)
-    
     # 분산 처리 초기화
     torch.distributed.init_process_group(
         backend="nccl",
@@ -440,6 +438,8 @@ def setup(rank, world_size, args):
         world_size=world_size,
         rank=rank
     )
+    # CUDA 설정
+    torch.cuda.set_device(rank)
 
 def cleanup():
     dist.destroy_process_group()
@@ -537,7 +537,7 @@ def train_with_config(rank, world_size, args):
     )
     
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
-    val_sampler   = DistributedSampler(val_dataset,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
+    val_sampler = DistributedSampler(val_dataset,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
 
     # 워커 수는 보수적으로
     workers = max(2, min(4, (os.cpu_count() or 8) // max(1, 2*world_size)))
@@ -663,7 +663,7 @@ def parse_args():
                         help='Number of points between successive STFT segments')
     parser.add_argument('--stft_power', type=float, default=1.0,
                         help='Power of magnitude (1.0 for magnitude, 2.0 for power spectrum)')
-    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-final_1105')
+    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-final_1105night_2050')
     parser.add_argument('--pretrained', type=bool, default=False,
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,

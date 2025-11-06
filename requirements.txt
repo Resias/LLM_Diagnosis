@@ -9,7 +9,6 @@ numpy==2.3.4
 pandas==2.3.3
 peft==0.17.1
 pytorch_lightning==2.5.5
-PyYAML==6.0.2
 PyYAML==6.0.3
 scikit_learn==1.7.2
 scipy==1.16.3

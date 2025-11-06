@@ -116,7 +116,7 @@ class VibrationDataset(Dataset):
                 self.index_map.append((row_idx, s))
 
             if row_idx not in self._file_cache:
-                self._file_cache[row_idx] = np.load(file_path)  # (S, N), ndarray in RAM
+                self._file_cache[row_idx] = np.load(file_path, mmap_mode='r')  # (S, N), ndarray in RAM
             
 
         # ---- Build normal-reference window pool: key = (dataset, load_condition) ----
@@ -156,9 +156,11 @@ class VibrationDataset(Dataset):
 
     def _extract_segment(self, row_idx, start):
         """Return (seg ndarray shape (2, win_n)) for the given row & start, respecting cache_mode."""
-        row = self.meta_df.iloc[row_idx]
+        #row
+        _ = self.meta_df.iloc[row_idx]
         meta = self._row_meta[row_idx]
-        sr, x_idx, y_idx, win_n = meta["sr"], meta["x_idx"], meta["y_idx"], meta["win_n"]
+        #sr
+        _, x_idx, y_idx, win_n = meta["sr"], meta["x_idx"], meta["y_idx"], meta["win_n"]
 
         base = self._file_cache[row_idx]
         x_seg = base[x_idx, start:start+win_n]
@@ -202,22 +204,22 @@ class VibrationDataset(Dataset):
         class_idx = self.class_list.index(row['merged_class'])
         x_cls = torch.tensor(class_idx ,dtype=torch.long)
 
-        x_info = {
-            "sampling_rate": float(sr),
-            "rpm": float(row["rpm"]),
-            "label_class": str(row["class_name"]),
-            "merged_class": str(row["merged_class"]),
-            "severity": str(row["severity"]),
-            "load_condition": str(row["load_condition"]),
-            "dataset": str(row["dataset"]),
-            "file_name": str(row["file_name"]),
-        }
+        # x_info = {
+        #     "sampling_rate": float(sr),
+        #     "rpm": float(row["rpm"]),
+        #     "label_class": str(row["class_name"]),
+        #     "merged_class": str(row["merged_class"]),
+        #     "severity": str(row["severity"]),
+        #     "load_condition": str(row["load_condition"]),
+        #     "dataset": str(row["dataset"]),
+        #     "file_name": str(row["file_name"]),
+        # }
         
         data_dict = {
-                'x_vib' : x_vib, 
+                # 'x_vib' : x_vib, 
                 'x_stft' : x_stft,
                 'x_cls' : x_cls,
-                'x_info' : x_info
+                # 'x_info' : x_info
             }
 
         # ---- normal reference (same dataset & load_condition) ----
@@ -233,21 +235,22 @@ class VibrationDataset(Dataset):
                 ref_vib = self._extract_segment(ref_row_idx, ref_start)
                 ref_stft = self.transform(ref_vib, sr=ref_sr, rpm=float(ref_row["rpm"]))
                 tensor_cls_norm = torch.tensor(self.class_list.index('normal'), dtype=torch.long)
-                ref_info = {
-                    "sampling_rate": float(ref_sr),
-                    "rpm": float(ref_row["rpm"]),
-                    "label_class": str(ref_row["class_name"]),
-                    "merged_class": str(ref_row["merged_class"]),
-                    "severity": str(ref_row["severity"]),
-                    "load_condition": str(ref_row["load_condition"]),
-                    "dataset": str(ref_row["dataset"]),
-                    "file_name": str(ref_row["file_name"]),
-                }
+                # ref_info = {
+                #     "sampling_rate": float(ref_sr),
+                #     "rpm": float(ref_row["rpm"]),
+                #     "label_class": str(ref_row["class_name"]),
+                #     "merged_class": str(ref_row["merged_class"]),
+                #     "severity": str(ref_row["severity"]),
+                #     "load_condition": str(ref_row["load_condition"]),
+                #     "dataset": str(ref_row["dataset"]),
+                #     "file_name": str(ref_row["file_name"]),
+                # }
                 ref_dict = {
-                            'ref_vib' : ref_vib,
+                            # 'ref_vib' : ref_vib,
                             'ref_stft' : ref_stft, 
                             'ref_cls' : tensor_cls_norm, 
-                            'ref_info' : ref_info}
+                            # 'ref_info' : ref_info
+                            }
                 
             data_dict.update(ref_dict)
             
