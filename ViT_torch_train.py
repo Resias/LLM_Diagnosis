@@ -196,7 +196,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
             with torch.autocast(device_type='cuda', dtype=autocast_dtype):
                 rec, _, masked_idx = net.forward_mae(img=x)
-                loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
+                # loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
+                loss_mae = nn.MSELoss()(rec, x)
 
                 logits, diff = net.forward_classify(current_img=x, normal_img=ref_x)
                 loss_cls = criterion(logits, y)
@@ -283,7 +284,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
                 with torch.autocast(device_type='cuda', dtype=autocast_dtype):
                     rec, _, masked_idx = net.forward_mae(img=x)
-                    b_loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
+                    # b_loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
+                    b_loss_mae = nn.MSELoss()(rec, x)
 
                     logits, diff = net.forward_classify(current_img=x, normal_img=ref_x)
                     b_loss_cls = criterion(logits, y)
@@ -521,7 +523,7 @@ def train_with_config(rank, world_size, args):
     # 학습용 데이터셋 생성
     train_dataset = VibrationDataset(
         data_root=data_root,
-        using_dataset = ['vat', 'vbl', 'mfd'],
+        using_dataset = ['vat', 'vbl', 'mfd', 'dxai'],
         window_sec=config.window_sec,
         stride_sec=config.stride_sec,
         transform=signal_imger
@@ -614,12 +616,13 @@ def run_training(args):
     os.makedirs('checkpoints', exist_ok=True)
     
     try:
-        mp.spawn(
-            train_with_config,
-            args=(world_size, args),
-            nprocs=world_size,
-            join=True
-        )
+        # mp.spawn(
+        #     train_with_config,
+        #     args=(world_size, args),
+        #     nprocs=world_size,
+        #     join=True
+        # )
+        train_with_config(rank=0, world_size=world_size, args=args)
     except Exception as e:
         print(f"Error during training: {e}")
         raise
