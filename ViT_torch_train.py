@@ -451,7 +451,7 @@ def train_with_config(rank, world_size, args):
 
     # wandb 초기화 (메인 프로세스에서만)
     if rank == 0:
-        wandb.init(project=args.project_name, name=arg.run_name, config=vars(args))
+        wandb.init(project=args.project_name, name=args.run_name, config=vars(args))
     
     # --- (B) rank0의 config(dict) -> 모든 rank로 브로드캐스트 ---
     if rank == 0 and wandb.run is not None:
