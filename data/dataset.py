@@ -255,7 +255,17 @@ class VibrationDataset(Dataset):
             data_dict.update(ref_dict)
             
         return data_dict
-    
+  
+class CachedDataset(Dataset):
+    def __init__(self, data_root: str):
+        self.data_root = data_root
+        self.data_list = torch.load(data_root)
+
+    def __len__(self):
+        return len(self.data_list)
+
+    def __getitem__(self, idx):
+        return self.data_list[idx]
 
 def starts_for(n, win_n, stride_n, drop_last=True):
     if win_n <= 0 or stride_n <= 0: raise ValueError("win_n/stride_n must be > 0")
@@ -634,7 +644,7 @@ if __name__ == '__main__':
                                 stride_sec=3,             
                                 transform=signal_imger,
                             )
-    
+
     data_dict = vib_trainset[0]
     for k in data_dict.keys():
         print(f'\nkey : {k}')
@@ -642,8 +652,31 @@ if __name__ == '__main__':
         print(f'type : {type(data_dict[k])}\n')
     
     print('Train Set Testing')
+    all_train_data = []
+    all_valid_data = []
+    for data_sample in tqdm(vib_trainset):
+        all_train_data.append(data_sample)
+    print('Validation Set Testing')
+    for data_sample in tqdm(vib_valset):
+        all_valid_data.append(data_sample)
+    
+    # =========== SAVE ===================
+    torch.save(all_train_data, os.path.join(args.data_root, 'llm_vib_trainset_except_dxai.pt'))
+    torch.save(all_valid_data, os.path.join(args.data_root, 'llm_vib_validset_except_dxai.pt'))
+
+    # =========== LOAD & TEST CACHED DATASET ===================
+    train_data_root = os.path.join(args.data_root, 'llm_vib_trainset_except_dxai.pt')
+    valid_data_root = os.path.join(args.data_root, 'llm_vib_validset_except_dxai.pt')
+
+    vib_trainset = CachedDataset(data_root=train_data_root)
+    vib_valset = CachedDataset(data_root=valid_data_root)
     for data_sample in tqdm(vib_trainset):
         continue
+    data_dict =vib_trainset[0]
+    for k in data_dict.keys():
+        print(f'\nkey : {k}')
+        print(f'item : {data_dict[k]}')
+        print(f'type : {type(data_dict[k])}\n')
     print('Validation Set Testing')
     for data_sample in tqdm(vib_valset):
         continue
