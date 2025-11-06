@@ -615,7 +615,84 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size',    type=int, default=32, help='학습 배치사이즈')
     args = parser.parse_args()
     
-    signal_imger = OrderInvariantSignalImager(
+    #
+    # # ================= ALL DATASET TEST & SAVE ======================
+    #
+    # signal_imger = OrderInvariantSignalImager(
+    #                             mode='stft+cross',
+    #                             log1p=True,
+    #                             normalize= "per_channel",  
+    #                             eps=1e-8,
+    #                             out_dtype=torch.float32,
+    #                             max_order=20.0,           
+    #                             H_out=224,                
+    #                             W_out=224,               
+    #                             stft_nperseg=1024,
+    #                             stft_hop=256,
+    #                             stft_window="hann",
+    #                             stft_center=True,
+    #                             stft_power=1.0,           
+    #                         )
+    # vib_trainset = VibrationDataset(
+    #                             data_root=args.data_root,
+    #                             using_dataset = ['vat', 'vbl', 'mfd', 'dxai'],
+    #                             window_sec=5,
+    #                             stride_sec=3,            
+    #                             transform=signal_imger,
+    #                         )
+    # vib_valset = VibrationDataset(
+    #                             data_root=args.data_root,
+    #                             using_dataset = ['dxai'],
+    #                             window_sec=5,
+    #                             stride_sec=3,             
+    #                             transform=signal_imger,
+    #                         )
+    # print('Train Set Testing')
+    # all_train_data = []
+    # all_valid_data = []
+    # for data_sample in tqdm(vib_trainset, dynamic_ncols=True):
+    #     all_train_data.append(data_sample)
+    # print('Validation Set Testing')
+    # for data_sample in tqdm(vib_valset, dynamic_ncols=True):
+    #     all_valid_data.append(data_sample)
+
+
+    # =========== SAVE ===================
+    # torch.save(all_train_data, os.path.join(args.data_root, 'llm_vib_trainset_4dataset.pt'))
+    # torch.save(all_valid_data, os.path.join(args.data_root, 'llm_vib_validset_4dataset_only_dxai.pt'))
+
+
+    # # =========== LOAD & TEST CACHED DATASET ===================
+    # train_data_root = os.path.join(args.data_root, 'llm_vib_trainset_4dataset.pt')
+    # valid_data_root = os.path.join(args.data_root, 'llm_vib_validset_4dataset_only_dxai.pt')
+    # vib_trainset_cached = CachedDataset(data_root=train_data_root)
+    # vib_valset_cached = CachedDataset(data_root=valid_data_root)
+
+    # data_dict = vib_trainset[0]
+    # for k in data_dict.keys():
+    #     print(f'\nkey : {k}')
+    #     print(f'item : {data_dict[k]}')
+    #     print(f'type : {type(data_dict[k])}\n')
+    # data_dict =vib_trainset_cached[0]    
+    # for k in data_dict.keys():
+    #     print(f'\nkey : {k}')
+    #     print(f'item : {data_dict[k]}')
+    #     print(f'type : {type(data_dict[k])}\n')
+    # print("Train len(before save):", len(vib_trainset))
+    # print("Valid len(before save):", len(vib_valset))
+    # print("Train len(after load):", len(vib_trainset_cached))
+    # print("Valid len(after load):", len(vib_valset_cached))
+
+
+
+
+    # # ================= LOO DATASET TEST & SAVE ======================
+    print("Processing LOO DATASET")
+    print("Processing LOO DATASET")
+    print("Processing LOO DATASET")
+    dataset_list = ['vat', 'vbl', 'mfd', 'dxai']
+    for except_dataset in dataset_list:
+        signal_imger = OrderInvariantSignalImager(
                                 mode='stft+cross',
                                 log1p=True,
                                 normalize= "per_channel",  
@@ -630,53 +707,51 @@ if __name__ == '__main__':
                                 stft_center=True,
                                 stft_power=1.0,           
                             )
-    vib_trainset = VibrationDataset(
-                                data_root=args.data_root,
-                                using_dataset = ['vat', 'vbl', 'mfd', 'dxai'],
-                                window_sec=5,
-                                stride_sec=3,            
-                                transform=signal_imger,
-                            )
-    vib_valset = VibrationDataset(
-                                data_root=args.data_root,
-                                using_dataset = ['dxai'],
-                                window_sec=5,
-                                stride_sec=3,             
-                                transform=signal_imger,
-                            )
+        vib_trainset = VibrationDataset(
+                                    data_root=args.data_root,
+                                    using_dataset = [d for d in dataset_list if d != except_dataset],
+                                    window_sec=5,
+                                    stride_sec=3,            
+                                    transform=signal_imger,
+                                )
+        vib_valset = VibrationDataset(
+                                    data_root=args.data_root,
+                                    using_dataset = [except_dataset],
+                                    window_sec=5,
+                                    stride_sec=3,             
+                                    transform=signal_imger,
+                                )
+        all_train_data = []
+        all_valid_data = []
+        for data_sample in tqdm(vib_trainset, dynamic_ncols=True, desc="Train dataset gathering"):
+            all_train_data.append(data_sample)
+        for data_sample in tqdm(vib_valset, dynamic_ncols=True, desc="Valid dataset gathering"):
+            all_valid_data.append(data_sample)
+        # =========== SAVE ===================
+        torch.save(all_train_data, os.path.join(args.data_root, f'llm_vib_trainset_3dataset_except_{except_dataset}.pt'))
+        torch.save(all_valid_data, os.path.join(args.data_root, f'llm_vib_validset_only_{except_dataset}.pt'))
+
+        # =========== LOAD & TEST CACHED DATASET ===================
+        train_data_root = os.path.join(args.data_root, f'llm_vib_trainset_3dataset_except_{except_dataset}.pt')
+        valid_data_root = os.path.join(args.data_root, f'llm_vib_validset_only_{except_dataset}.pt')
+
+        vib_trainset_cached = CachedDataset(data_root=train_data_root)
+        vib_valset_cached = CachedDataset(data_root=valid_data_root)
+
+        data_dict = vib_trainset[0]
+        for k in data_dict.keys():
+            print(f'\nkey : {k}')
+            print(f'item : {data_dict[k]}')
+            print(f'type : {type(data_dict[k])}\n')
+        data_dict =vib_trainset_cached[0]    
+        for k in data_dict.keys():
+            print(f'\nkey : {k}')
+            print(f'item : {data_dict[k]}')
+            print(f'type : {type(data_dict[k])}\n')
+        
+        print(except_dataset, 'is valid dataset')
+        print("Train len(before save):", len(vib_trainset))
+        print("Valid len(before save):", len(vib_valset))
+        print("Train len(after load):", len(vib_trainset_cached))
+        print("Valid len(after load):", len(vib_valset_cached))
     
-    # print('Train Set Testing')
-    # all_train_data = []
-    # all_valid_data = []
-    # for data_sample in tqdm(vib_trainset, dynamic_ncols=True):
-    #     all_train_data.append(data_sample)
-    # print('Validation Set Testing')
-    # for data_sample in tqdm(vib_valset, dynamic_ncols=True):
-    #     all_valid_data.append(data_sample)
-
-    # =========== SAVE ===================
-    # torch.save(all_train_data, os.path.join(args.data_root, 'llm_vib_trainset_4dataset.pt'))
-    # torch.save(all_valid_data, os.path.join(args.data_root, 'llm_vib_validset_4dataset_only_dxai.pt'))
-
-    # =========== LOAD & TEST CACHED DATASET ===================
-    train_data_root = os.path.join(args.data_root, 'llm_vib_trainset_4dataset.pt')
-    valid_data_root = os.path.join(args.data_root, 'llm_vib_validset_4dataset_only_dxai.pt')
-
-    vib_trainset_cached = CachedDataset(data_root=train_data_root)
-    vib_valset_cached = CachedDataset(data_root=valid_data_root)
-
-    data_dict = vib_trainset[0]
-    for k in data_dict.keys():
-        print(f'\nkey : {k}')
-        print(f'item : {data_dict[k]}')
-        print(f'type : {type(data_dict[k])}\n')
-    data_dict =vib_trainset_cached[0]    
-    for k in data_dict.keys():
-        print(f'\nkey : {k}')
-        print(f'item : {data_dict[k]}')
-        print(f'type : {type(data_dict[k])}\n')
-    
-    print("Train len(before save):", len(vib_trainset))
-    print("Valid len(before save):", len(vib_valset))
-    print("Train len(after load):", len(vib_trainset_cached))
-    print("Valid len(after load):", len(vib_valset_cached))

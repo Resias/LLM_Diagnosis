@@ -451,7 +451,7 @@ def train_with_config(rank, world_size, args):
 
     # wandb 초기화 (메인 프로세스에서만)
     if rank == 0:
-        wandb.init(project=args.project_name, config=vars(args))
+        wandb.init(project=args.project_name, name=arg.run_name, config=vars(args))
     
     # --- (B) rank0의 config(dict) -> 모든 rank로 브로드캐스트 ---
     if rank == 0 and wandb.run is not None:
@@ -498,13 +498,35 @@ def train_with_config(rank, world_size, args):
     # 데이터 준비
     data_root = os.path.join(os.getcwd(), config.data_root)
     if config.cached:
+        # 0: all, 1: except vat, 2: except vbl, 3: except mfd, 4: except dxai
         selected = config.dataset_select
         if selected == 0:
             train_data_root = os.path.join(data_root, "llm_vib_trainset_4dataset.pt")
             train_dataset = CachedDataset(data_root=train_data_root)
             val_data_root = os.path.join(data_root, "llm_vib_validset_4dataset_only_dxai.pt")
             val_dataset = CachedDataset(data_root=val_data_root)
-
+        elif selected == 1:
+            train_data_root = os.path.join(data_root, "llm_vib_trainset_3dataset_except_vat.pt")
+            train_dataset = CachedDataset(data_root=train_data_root)
+            val_data_root = os.path.join(data_root, "llm_vib_validset_only_vat.pt")
+            val_dataset = CachedDataset(data_root=val_data_root)
+        elif selected == 2:
+            train_data_root = os.path.join(data_root, "llm_vib_trainset_3dataset_except_vbl.pt")
+            train_dataset = CachedDataset(data_root=train_data_root)
+            val_data_root = os.path.join(data_root, "llm_vib_validset_only_vbl.pt")
+            val_dataset = CachedDataset(data_root=val_data_root)
+        elif selected == 3:
+            train_data_root = os.path.join(data_root, "llm_vib_trainset_3dataset_except_mfd.pt")
+            train_dataset = CachedDataset(data_root=train_data_root)
+            val_data_root = os.path.join(data_root, "llm_vib_validset_only_mfd.pt")
+            val_dataset = CachedDataset(data_root=val_data_root)
+        elif selected == 4:
+            train_data_root = os.path.join(data_root, "llm_vib_trainset_3dataset_except_dxai.pt")
+            train_dataset = CachedDataset(data_root=train_data_root)
+            val_data_root = os.path.join(data_root, "llm_vib_validset_only_dxai.pt")
+            val_dataset = CachedDataset(data_root=val_data_root)
+        else:
+            raise ValueError("Unexpected selected caching dataset index.")
     else:
         # 이미지 변환기 설정 (pretrained 모델 사용 시 224x224로 강제)
         output_size = 224 if config.pretrained else config.image_size
@@ -674,7 +696,9 @@ def parse_args():
                         help='Number of points between successive STFT segments')
     parser.add_argument('--stft_power', type=float, default=1.0,
                         help='Power of magnitude (1.0 for magnitude, 2.0 for power spectrum)')
+    
     parser.add_argument('--project_name', type=str, default='vibration-diagnosis-final_1105night_2050')
+    parser.add_argument('--run_name', type=str, default='All_dataset_non_masking')
     parser.add_argument('--pretrained', type=bool, default=False,
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
