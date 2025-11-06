@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 
 from functools import partial
 
-from data.dataset import VibrationDataset, OrderInvariantSignalImager
+from data.dataset import VibrationDataset, OrderInvariantSignalImager, CachedDataset
 from sklearn.metrics import precision_score, recall_score, f1_score
 
 from tokenizer_trainer.models.ViT_pytorch import VisionTransformerAE
@@ -497,46 +497,54 @@ def train_with_config(rank, world_size, args):
     
     # 데이터 준비
     data_root = os.path.join(os.getcwd(), config.data_root)
-    
-    # 이미지 변환기 설정 (pretrained 모델 사용 시 224x224로 강제)
-    output_size = 224 if config.pretrained else config.image_size
-    if rank == 0 and config.pretrained and config.image_size != 224:
-        print(f"Warning: Pretrained model requires 224x224 input. "
-              f"Automatically adjusting output size from {config.image_size} to 224.")
-    
-    signal_imger = OrderInvariantSignalImager(
-        mode=config.stft_mode,
-        log1p=True,
-        normalize="per_channel", 
-        eps=1e-8,
-        out_dtype=torch.float32,
-        max_order=config.max_order,
-        H_out=output_size,
-        W_out=output_size,
-        stft_nperseg=config.stft_nperseg,
-        stft_hop=config.stft_hop,
-        stft_window="hann",
-        stft_center=True,
-        stft_power=config.stft_power,
-    )
-    
-    # 학습용 데이터셋 생성
-    train_dataset = VibrationDataset(
-        data_root=data_root,
-        using_dataset = ['vat', 'vbl', 'mfd', 'dxai'],
-        window_sec=config.window_sec,
-        stride_sec=config.stride_sec,
-        transform=signal_imger
-    )
-    
-    # 검증용 데이터셋 생성
-    val_dataset = VibrationDataset(
-        data_root=data_root,
-        using_dataset = ['dxai'],
-        window_sec=config.window_sec,
-        stride_sec=config.stride_sec,
-        transform=signal_imger
-    )
+    if config.cached:
+        selected = config.dataset_select
+        if selected == 0:
+            train_data_root = os.path.join(data_root, "llm_vib_trainset_4dataset.pt")
+            train_dataset = CachedDataset(data_root=train_data_root)
+            val_data_root = os.path.join(data_root, "llm_vib_validset_4dataset_only_dxai.pt")
+            val_dataset = CachedDataset(data_root=val_data_root)
+
+    else:
+        # 이미지 변환기 설정 (pretrained 모델 사용 시 224x224로 강제)
+        output_size = 224 if config.pretrained else config.image_size
+        if rank == 0 and config.pretrained and config.image_size != 224:
+            print(f"Warning: Pretrained model requires 224x224 input. "
+                f"Automatically adjusting output size from {config.image_size} to 224.")
+        
+        signal_imger = OrderInvariantSignalImager(
+            mode=config.stft_mode,
+            log1p=True,
+            normalize="per_channel", 
+            eps=1e-8,
+            out_dtype=torch.float32,
+            max_order=config.max_order,
+            H_out=output_size,
+            W_out=output_size,
+            stft_nperseg=config.stft_nperseg,
+            stft_hop=config.stft_hop,
+            stft_window="hann",
+            stft_center=True,
+            stft_power=config.stft_power,
+        )
+        
+        # 학습용 데이터셋 생성
+        train_dataset = VibrationDataset(
+            data_root=data_root,
+            using_dataset = ['vat', 'vbl', 'mfd', 'dxai'],
+            window_sec=config.window_sec,
+            stride_sec=config.stride_sec,
+            transform=signal_imger
+        )
+        
+        # 검증용 데이터셋 생성
+        val_dataset = VibrationDataset(
+            data_root=data_root,
+            using_dataset = ['dxai'],
+            window_sec=config.window_sec,
+            stride_sec=config.stride_sec,
+            transform=signal_imger
+        )
     
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
     val_sampler = DistributedSampler(val_dataset,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
@@ -673,6 +681,10 @@ def parse_args():
                         help='Port for distributed training')
     parser.add_argument('--warmup_epochs', type=int, default=1500,
                         help='epochs for reconstruction-only warm-up (classification weight=0)')
+    
+    parser.add_argument('--cached', action="store_true", help="Data loading True/False")
+    parser.add_argument('--dataset_select', type=int, default=0, help="0: all, 1: except vat, 2: except vbl, 3: except mfd, 4: except dxai")
+
 
 
     return parser.parse_args()
