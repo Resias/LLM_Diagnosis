@@ -379,7 +379,13 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc,
                 }, os.path.join('checkpoints', 'best_model.pth'))
-
+            state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': state_dict,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_acc': val_acc,
+                }, os.path.join('checkpoints', 'current_model.pth'))
             print(f"[{epoch+1}/{num_epochs}] "
                   f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% | "
                   f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}%")
@@ -392,7 +398,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 K = min(EMB_PER_RANK, last_train_diff.size(0))
                 idx = torch.randint(0, last_train_diff.size(0), (K,), device=last_train_diff.device)
                 emb_small  = last_train_diff[idx]
-                y_small    = last_train_y[idx]
+                y_small = last_train_y[idx]
                 pred_small = last_train_logits.argmax(dim=1)[idx]
 
                 # 여러 rank 샘플 모으기(작을 때만)
