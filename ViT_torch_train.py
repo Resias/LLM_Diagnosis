@@ -34,45 +34,86 @@ def _ddp_sum_tensor(t):
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t
 
-def _to_uint8_image(t: torch.Tensor):
-    """
-    t: (C,H,W) float/half, arbitrary range. -> uint8 HxW or HxW xC
-    1) detach->cpu  2) min-max normalize per-image  3) to uint8
-    """
-    t = t.detach().float().cpu()
-    if t.dim() == 3:  # C,H,W
-        # 시각화 채널 결정: C>=3이면 처음 3채널, 그 외엔 채널 평균
-        if t.size(0) >= 3:
-            img = t[:3]  # (3,H,W)
-        else:
-            img = t.mean(0, keepdim=True).repeat(3,1,1)  # (3,H,W)
-        img = (img - img.min()) / (img.max() - img.min() + 1e-8)
-        img = (img * 255.0).clamp(0,255).byte().permute(1,2,0).numpy()  # H,W,3
-        return img
-    elif t.dim() == 2:  # H,W
-        img = (t - t.min()) / (t.max() - t.min() + 1e-8)
-        img = (img * 255.0).clamp(0,255).byte().numpy()
-        return img
-    else:
-        raise ValueError("Unexpected tensor shape for image.")
+def _downsample_chw(t: torch.Tensor, factor: int) -> torch.Tensor:
+    """Stride 다운샘플(보간 없음) — 빠르고 메모리 절약"""
+    if factor <= 1:
+        return t
+    return t[:, ::factor, ::factor]
+def _channel_labels_for_mode(mode: str):
+    m = (mode or "").lower()
+    if m == "stft":
+        return ["|X|^p", "|Y|^p"]
+    if m == "stft+cross":
+        return ["|X|^p", "|Y|^p", "|X·Y*|", "cos(Δφ)"]
+    if m == "stft_complex":
+        return ["|Z|", "cos(∠Z)", "sin(∠Z)", "∠Z−90°"]
+    return [f"ch{i}" for i in range(16)]
 
-def log_recon_image_wandb(orig: torch.Tensor, rec: torch.Tensor, tag: str, epoch: int, downsample: int = 2):
-    """
-    orig/rec: (C,H,W). 메모리 절약을 위해 다운샘플, uint8 변환 후 wandb.Image로 로깅.
-    """
-    # 다운샘플 (stride indexing; 보간 없음 → 빠름)
-    if downsample > 1:
-        orig = orig[:, ::downsample, ::downsample]
-        rec  = rec[:,  ::downsample, ::downsample]
-    orig_img = _to_uint8_image(orig)
-    rec_img  = _to_uint8_image(rec)
+def _to_uint8_gray2d(t2d: torch.Tensor) -> np.ndarray:
+    """(H,W) float/half -> (H,W) uint8, per-image min-max 정규화"""
+    x = t2d.detach().float().cpu()
+    x = (x - x.min()) / (x.max() - x.min() + 1e-8)
+    return (x * 255.0).clamp(0, 255).byte().numpy()
 
-    # 간단 비교 figure (2열)
-    fig, axes = plt.subplots(1, 2, figsize=(6,3), dpi=100)
-    axes[0].imshow(orig_img); axes[0].axis("off"); axes[0].set_title("orig")
-    axes[1].imshow(rec_img);  axes[1].axis("off"); axes[1].set_title("recon")
-    wandb.log({tag: wandb.Image(fig), "epoch": int(epoch)})
-    plt.close(fig)
+def _side_by_side_gray(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """(H,W) uint8 두 장을 가로로 붙여 (H,2W,3)"""
+    if a.shape != b.shape:
+        # 높이 기준 최근접 스케일
+        H = min(a.shape[0], b.shape[0])
+        def resize_w(h, img):
+            scale = H / img.shape[0]
+            new_w = max(1, int(round(img.shape[1] * scale)))
+            x_old = np.linspace(0, img.shape[1]-1, img.shape[1])
+            x_new = np.linspace(0, img.shape[1]-1, new_w)
+            out = np.empty((H, new_w), dtype=img.dtype)
+            for r in range(H):
+                out[r, :] = np.interp(x_new, x_old, img[int(r/scale), :]).astype(np.uint8)
+            return out
+        a = resize_w(H, a); b = resize_w(H, b)
+    # 그레이 → RGB 반복
+    a3 = np.repeat(a[:, :, None], 3, axis=2)
+    b3 = np.repeat(b[:, :, None], 3, axis=2)
+    return np.concatenate([a3, b3], axis=1)
+
+def log_batch_recon_single_channel_to_wandb(
+    x: torch.Tensor,                # (B,C,H,W)
+    rec: torch.Tensor,              # (B,C,H,W)
+    tag: str,
+    epoch: int,
+    mode: str,
+    ch_idx: int = 0,                # 사용할 채널 인덱스
+    k: int = 4,                     # 배치에서 로그할 샘플 수
+    downsample: int = 2
+):
+    """
+    4채널(또는 C개) 중 ch_idx 채널만 선택해서 origin vs recon 2분할로 로깅.
+    rank0에서만 호출할 것(외부 보장).
+    """
+    if wandb.run is None:
+        return
+    B, C, H, W = x.shape
+    if C == 0:
+        return
+    ch_idx = int(ch_idx) % C  # 안전
+
+    labels = _channel_labels_for_mode(mode)
+    ch_name = labels[ch_idx] if ch_idx < len(labels) else f"ch{ch_idx}"
+
+    k = min(k, B)
+    idx_list = torch.linspace(0, B - 1, steps=k).long().tolist()
+
+    for i in idx_list:
+        xi   = _downsample_chw(x[i],   downsample)  # (C,h,w)
+        reci = _downsample_chw(rec[i], downsample)
+        # 선택 채널 슬라이스 → (h,w)
+        xi_ch   = xi[ch_idx]
+        reci_ch = reci[ch_idx]
+        # uint8 그레이
+        a = _to_uint8_gray2d(xi_ch)
+        b = _to_uint8_gray2d(reci_ch)
+        comp = _side_by_side_gray(a, b)  # (h,2w,3)
+        wandb.log({tag: wandb.Image(comp, caption=f"channel={ch_name} ({ch_idx}) | left:orig, right:recon"),
+                   "epoch": int(epoch)})
 
 def sample_rows_for_table(arr_list, max_rows: int):
     """
@@ -155,11 +196,17 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
     autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
     
     # 로깅 주기/용량 제한
-    IMG_LOG_EVERY = getattr(config, "img_log_every", 100)
-    EMB_LOG_EVERY = getattr(config, "emb_log_every", 100)
-    EMB_PER_RANK  = getattr(config, "emb_per_rank", 32)
-    TABLE_MAX_ROWS = getattr(config, "table_max_rows", 200)
+    IMG_LOG_EVERY   = getattr(config, "img_log_every", 100)
+    IMG_LOG_K       = getattr(config, "img_log_k", 4)
+    IMG_DOWNSAMPLE  = getattr(config, "img_downsample", 2)
+    LOG_IMAGES      = bool(getattr(config, "log_images", False))
+    LOG_CHANNEL    = int(getattr(config, "log_channel", 0))
     
+    LOG_EMB         = bool(getattr(config, "log_embeddings", False))
+    EMB_LOG_EVERY   = int(getattr(config, "emb_log_every", 100))
+    EMB_PER_RANK    = int(getattr(config, "emb_per_rank", 32))
+    TABLE_MAX_ROWS  = int(getattr(config, "table_max_rows", 200))
+
     for epoch in range(num_epochs):
         effective_alpha = 0.0 if epoch < warmup_epochs else float(alpha)
 
@@ -218,13 +265,22 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             train_labels_local.append(y.detach())
             
             # 이미지 로깅: 첫 배치에서만, 큰 간격으로
-            if (not first_train_image_logged) and is_main and wandb.run is not None and (epoch % IMG_LOG_EVERY == 0):
-                # 배치의 첫 샘플만 사용
+            if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
+                # 채널 선택(-1이면 에폭별 순환)
+                C = x.shape[1]
+                ch_sel = (epoch % C) if (LOG_CHANNEL == -1 and C > 0) else max(0, min(LOG_CHANNEL, C-1))
                 try:
-                    log_recon_image_wandb(x[0], rec[0], tag="images/train_recon", epoch=epoch, downsample=2)
-                    first_train_image_logged = True
+                    log_batch_recon_single_channel_to_wandb(
+                        x=x, rec=rec,
+                        tag="images/train_ch_orig_vs_recon",
+                        epoch=epoch,
+                        mode=getattr(config, "stft_mode", "stft+cross"),
+                        ch_idx=ch_sel,
+                        k=IMG_LOG_K,
+                        downsample=IMG_DOWNSAMPLE
+                    )
                 except Exception:
-                    pass  # 로깅 실패해도 학습은 계속
+                    pass
 
             # 임베딩 테이블은 에폭 말에 한 번만 기록할 것이므로 마지막 배치 참조만 유지
             last_train_diff = diff.detach()
@@ -302,10 +358,19 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 val_labels_local.append(y.detach())
 
                 # 이미지 로깅: 첫 배치에서만, 큰 간격으로
-                if (not first_val_image_logged) and is_main and wandb.run is not None and (epoch % IMG_LOG_EVERY == 0):
+                if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
+                    C = x.shape[1]
+                    ch_sel = (epoch % C) if (LOG_CHANNEL == -1 and C > 0) else max(0, min(LOG_CHANNEL, C-1))
                     try:
-                        log_recon_image_wandb(x[0], rec[0], tag="images/val_recon", epoch=epoch, downsample=2)
-                        first_val_image_logged = True
+                        log_batch_recon_single_channel_to_wandb(
+                            x=x, rec=rec,
+                            tag="images/val_ch_orig_vs_recon",
+                            epoch=epoch,
+                            mode=getattr(config, "stft_mode", "stft+cross"),
+                            ch_idx=ch_sel,
+                            k=IMG_LOG_K,
+                            downsample=IMG_DOWNSAMPLE
+                        )
                     except Exception:
                         pass
 
@@ -379,29 +444,30 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_acc': val_acc,
                 }, os.path.join('checkpoints', 'best_model.pth'))
-            state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': state_dict,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_acc': val_acc,
-                }, os.path.join('checkpoints', 'current_model.pth'))
             print(f"[{epoch+1}/{num_epochs}] "
                   f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% | "
                   f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}%")
+        state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': state_dict,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'val_acc': val_acc,
+        }, os.path.join('checkpoints', 'last_model.pth'))
 
+        
         # ---------------- Light Logging (embeddings table) ----------------
-        # 에폭 주기마다, 배치 '마지막' diff에서만 소량 샘플링해서 테이블에 올림
-        if wandb.run is not None and (epoch % EMB_LOG_EVERY == 0):
+        if LOG_EMB and wandb.run is not None and (epoch % EMB_LOG_EVERY == 0):
             # Train
-            if last_train_diff is not None and last_train_logits is not None and last_train_y is not None:
+            if (last_train_diff is not None and last_train_logits is not None and last_train_y is not None
+                and last_train_diff.ndim == 2 and last_train_logits.ndim == 2 and last_train_y.ndim == 1
+                and last_train_diff.size(0) > 0):
                 K = min(EMB_PER_RANK, last_train_diff.size(0))
                 idx = torch.randint(0, last_train_diff.size(0), (K,), device=last_train_diff.device)
                 emb_small  = last_train_diff[idx]
-                y_small = last_train_y[idx]
+                y_small    = last_train_y[idx]
                 pred_small = last_train_logits.argmax(dim=1)[idx]
 
-                # 여러 rank 샘플 모으기(작을 때만)
                 emb_small  = ddp_gather_small_tensor(emb_small)
                 y_small    = ddp_gather_small_tensor(y_small)
                 pred_small = ddp_gather_small_tensor(pred_small)
@@ -414,7 +480,9 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                     )
 
             # Val
-            if last_val_diff is not None and last_val_logits is not None and last_val_y is not None:
+            if (last_val_diff is not None and last_val_logits is not None and last_val_y is not None
+                and last_val_diff.ndim == 2 and last_val_logits.ndim == 2 and last_val_y.ndim == 1
+                and last_val_diff.size(0) > 0):
                 K = min(EMB_PER_RANK, last_val_diff.size(0))
                 idx = torch.randint(0, last_val_diff.size(0), (K,), device=last_val_diff.device)
                 emb_small  = last_val_diff[idx]
@@ -712,6 +780,28 @@ def parse_args():
     parser.add_argument('--warmup_epochs', type=int, default=1500,
                         help='epochs for reconstruction-only warm-up (classification weight=0)')
     
+    parser.add_argument('--log_channel', type=int, default=0,
+                    help='로깅할 채널 인덱스 (예: stft+cross 기준 0:|X|^p, 1:|Y|^p, 2:|X·Y*|, 3:cosΔφ). '
+                         '-1이면 에폭마다 채널을 순환.')
+    parser.add_argument('--log_images', action='store_true',
+                    help='이미지 로깅 활성화 (rank0 전용)')
+    parser.add_argument('--img_log_every', type=int, default=100,
+                        help='이미지 로깅 에폭 주기')
+    parser.add_argument('--img_log_k', type=int, default=4,
+                        help='배치에서 로깅할 최대 샘플 수')
+    parser.add_argument('--img_downsample', type=int, default=2,
+                        help='로깅 시 CHW stride 다운샘플 배수')
+
+    parser.add_argument('--log_embeddings', action='store_true',
+                        help='임베딩 테이블 로깅 활성화 (rank0 전용)')
+    parser.add_argument('--emb_log_every', type=int, default=100,
+                        help='임베딩 테이블 로깅 에폭 주기')
+    parser.add_argument('--emb_per_rank', type=int, default=32,
+                        help='각 rank에서 샘플링할 임베딩 개수 (작게 유지)')
+    parser.add_argument('--table_max_rows', type=int, default=200,
+                        help='W&B 테이블로 올릴 최대 행 수 (합쳐진 후)')
+
+
     parser.add_argument('--cached', action="store_true", help="Data loading True/False")
     parser.add_argument('--dataset_select', type=int, default=0, help="0: all, 1: except vat, 2: except vbl, 3: except mfd, 4: except dxai")
 

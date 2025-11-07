@@ -67,12 +67,7 @@ def print_sample_info(sample, idx: int):
     x = sample.get("x_stft", None)
     ref = sample.get("ref_stft", None)
     y = sample.get("x_cls", None)
-    sid = sample.get("id", None) or sample.get("idx", None)
-    path = sample.get("path", "")
-
     print(f"[Sample {idx}]")
-    print(f"  id        : {sid}")
-    print(f"  path      : {path}")
     print(f"  x_stft    : {_shape(x)} dtype={getattr(x, 'dtype', None)}")
     print(f"  ref_stft  : {_shape(ref)} dtype={getattr(ref, 'dtype', None)}")
     if isinstance(y, torch.Tensor):
