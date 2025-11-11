@@ -18,6 +18,7 @@ from data.dataset import VibrationDataset, OrderInvariantSignalImager, CachedDat
 from sklearn.metrics import precision_score, recall_score, f1_score
 
 from tokenizer_trainer.models.ViT_pytorch import VisionTransformerAE
+from tokenizer_trainer.visualize import create_reconstruction_figure
 
 import wandb
 import ast
@@ -25,6 +26,21 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import argparse
 import types
+
+# 성능 옵션
+# torch.backends.cudnn.benchmark = True
+
+# torch.backends.cuda.matmul.allow_tf32 = True
+# torch.backends.cuda.matmul.fp32_precision = 'tf32'
+# torch.backends.cudnn.conv.fp32_precision = 'tf32'
+
+# torch.backends.cuda.matmul.fp32_precision = 'ieee'
+# torch.backends.cudnn.conv.fp32_precision = 'ieee'
+
+# try:
+#     torch.set_float32_matmul_precision("high")
+# except Exception:
+#     pass
 
 def unwrap_ddp(model):
     return model.module if isinstance(model, DDP) else model
@@ -176,19 +192,12 @@ def vib_collate(batch):
             out[k] = vals
     return out
 
-def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, num_epochs, device, rank, config):
+def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
+                num_epochs, device, rank, config, start_epoch=0, init_best_val_acc=0.0, dataset_select=None):
     net = unwrap_ddp(model)
     is_main = (rank == 0)
-    best_val_acc = 0.0
+    best_val_acc = float(init_best_val_acc)
     warmup_epochs = int(getattr(config, "warmup_epochs", 0))
-
-    # 성능 옵션
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
     
     # AMP
     use_bf16 = torch.cuda.is_bf16_supported()
@@ -207,7 +216,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
     EMB_PER_RANK    = int(getattr(config, "emb_per_rank", 32))
     TABLE_MAX_ROWS  = int(getattr(config, "table_max_rows", 200))
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         effective_alpha = 0.0 if epoch < warmup_epochs else float(alpha)
 
         # sampler epoch advance
@@ -218,7 +227,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
         # ---------------- Train ----------------
         # Training phase
-        model.train()
+        net.train()
         train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False) if is_main else train_loader
 
         loss_sum_local = 0.0
@@ -231,7 +240,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         last_train_diff = None
         last_train_logits = None
         last_train_y = None
-        first_train_image_logged = False
+        reconstruction_image_to_log = None
         
         # dataset에서 getitem에 인자 true로 설정해놓으면 아래와 같이 info도 같이 줌
         for i, batch in enumerate(train_iter):
@@ -266,21 +275,18 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
             
             # 이미지 로깅: 첫 배치에서만, 큰 간격으로
             if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
-                # 채널 선택(-1이면 에폭별 순환)
-                C = x.shape[1]
-                ch_sel = (epoch % C) if (LOG_CHANNEL == -1 and C > 0) else max(0, min(LOG_CHANNEL, C-1))
-                try:
-                    log_batch_recon_single_channel_to_wandb(
-                        x=x, rec=rec,
-                        tag="images/train_ch_orig_vs_recon",
-                        epoch=epoch,
-                        mode=getattr(config, "stft_mode", "stft+cross"),
-                        ch_idx=ch_sel,
-                        k=IMG_LOG_K,
-                        downsample=IMG_DOWNSAMPLE
-                    )
-                except Exception:
-                    pass
+                # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0] )
+                fig = create_reconstruction_figure(
+                    orig_tensor=x[0],
+                    rec_tensor=rec[0],
+                    mode=config.stft_mode,  # config에서 파라미터 가져오기
+                    max_order=config.max_order,
+                    window_sec=config.window_sec
+                )
+                # Figure를 wandb.Image 객체로 변환
+                reconstruction_image_to_log = wandb.Image(fig)
+                plt.close(fig)
+            
 
             # 임베딩 테이블은 에폭 말에 한 번만 기록할 것이므로 마지막 배치 참조만 유지
             last_train_diff = diff.detach()
@@ -305,20 +311,20 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         train_preds_local = torch.cat(train_preds_local, dim=0).detach().cpu().numpy()
         train_labels_local = torch.cat(train_labels_local, dim=0).detach().cpu().numpy()
         train_metrics = {
+            "precision_weighted": precision_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
+            "recall_weighted":    recall_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
+            "f1_weighted":        f1_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
             "precision_micro":  precision_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
             "recall_micro":     recall_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
             "f1_micro":         f1_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
             "precision_macro":  precision_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
             "recall_macro":     recall_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
             "f1_macro":         f1_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
-            "precision_weighted": precision_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
-            "recall_weighted":    recall_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
-            "f1_weighted":        f1_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
         }
         
         # ---------------- Val ----------------
         # Validation phase
-        model.eval()
+        net.eval()
         val_loss_sum_local = 0.0
         val_correct_local  = 0.0
         val_total_local    = 0.0
@@ -328,7 +334,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         last_val_diff = None
         last_val_logits = None
         last_val_y = None
-        first_val_image_logged = False
+        val_reconstruction_image_to_log = None
 
         val_iter = tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False) if is_main else val_loader
 
@@ -359,20 +365,17 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
 
                 # 이미지 로깅: 첫 배치에서만, 큰 간격으로
                 if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
-                    C = x.shape[1]
-                    ch_sel = (epoch % C) if (LOG_CHANNEL == -1 and C > 0) else max(0, min(LOG_CHANNEL, C-1))
-                    try:
-                        log_batch_recon_single_channel_to_wandb(
-                            x=x, rec=rec,
-                            tag="images/val_ch_orig_vs_recon",
-                            epoch=epoch,
-                            mode=getattr(config, "stft_mode", "stft+cross"),
-                            ch_idx=ch_sel,
-                            k=IMG_LOG_K,
-                            downsample=IMG_DOWNSAMPLE
-                        )
-                    except Exception:
-                        pass
+                    # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0] )
+                    fig = create_reconstruction_figure(
+                        orig_tensor=x[0],
+                        rec_tensor=rec[0],
+                        mode=config.stft_mode,  # config에서 파라미터 가져오기
+                        max_order=config.max_order,
+                        window_sec=config.window_sec
+                    )
+                    # Figure를 wandb.Image 객체로 변환
+                    val_reconstruction_image_to_log = wandb.Image(fig)
+                    plt.close(fig)
 
                 # 임베딩 로깅용 참조 저장(마지막 배치)
                 last_val_diff = diff.detach()
@@ -387,22 +390,21 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
         val_preds_local = torch.cat(val_preds_local, dim=0).detach().cpu().numpy()
         val_labels_local = torch.cat(val_labels_local, dim=0).detach().cpu().numpy()
         val_metrics = {
+            "precision_weighted": precision_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
+            "recall_weighted":    recall_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
+            "f1_weighted":        f1_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
             "precision_micro":  precision_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
             "recall_micro":     recall_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
             "f1_micro":         f1_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
             "precision_macro":  precision_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
             "recall_macro":     recall_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
             "f1_macro":         f1_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
-            "precision_weighted": precision_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
-            "recall_weighted":    recall_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
-            "f1_weighted":        f1_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
         }
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         
         # Log metrics to wandb
-        
         # ---------------- Light Logging (scalars) ----------------
         if is_main:
             log_dict = {
@@ -430,30 +432,49 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer, nu
                 "val/recall_weighted":    val_metrics["recall_weighted"],
                 "val/f1_weighted":        val_metrics["f1_weighted"],
             }
+            if reconstruction_image_to_log:
+                log_dict['train/reconstruction_comparison'] = reconstruction_image_to_log
+            if val_reconstruction_image_to_log:
+                log_dict['val/reconstruction_comparison'] = val_reconstruction_image_to_log
             if wandb.run is not None:
                 wandb.log(log_dict)
 
             # 베스트 저장
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                os.makedirs('checkpoints', exist_ok=True)
                 state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': state_dict,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_acc': val_acc,
-                }, os.path.join('checkpoints', 'best_model.pth'))
+                if dataset_select is None:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': state_dict,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_acc': val_acc,
+                    }, os.path.join('checkpoints', 'best_model.pth'))
+                else:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': state_dict,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_acc': val_acc,
+                    }, os.path.join(f'checkpoints', f'best_model_{dataset_select}.pth'))
             print(f"[{epoch+1}/{num_epochs}] "
                   f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% | "
                   f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}%")
         state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': state_dict,
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_acc': val_acc,
-        }, os.path.join('checkpoints', 'last_model.pth'))
+        if dataset_select is None:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+            }, os.path.join('checkpoints', 'last_model.pth'))
+        else:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+            }, os.path.join(f'checkpoints', f'last_model_{dataset_select}.pth'))
 
         
         # ---------------- Light Logging (embeddings table) ----------------
@@ -642,6 +663,22 @@ def train_with_config(rank, world_size, args):
             transform=signal_imger
         )
     
+    
+    if len(val_dataset) == 0 and rank == 0:
+        raise RuntimeError(
+            "Validation dataset is empty. "
+            "Check cached file: data/processed/llm_vib_validset_only_vbl.pt "
+            "or adjust --cached/--dataset_select."
+        )
+    if rank == 0:
+        print(f"#train_samples={len(train_dataset)}  #val_samples={len(val_dataset)}")
+        # DataLoader가 만들 배치 수(대략치)
+        try:
+            tmp_train_loader = DataLoader(train_dataset, batch_size=config.batch_size)
+            tmp_val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+            print(f"#train_batches≈{len(tmp_train_loader)}  #val_batches≈{len(tmp_val_loader)}")
+        except Exception as e:
+            print("DataLoader dry-run failed:", e)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
     val_sampler = DistributedSampler(val_dataset,   num_replicas=world_size, rank=rank, shuffle=False, drop_last=False)
 
@@ -701,7 +738,8 @@ def train_with_config(rank, world_size, args):
         num_epochs=config.epochs,
         device=device,
         rank=rank,
-        config=config
+        config=config,
+        dataset_select=args.dataset_select
     )
     
     cleanup()  # process group destroy
@@ -754,14 +792,18 @@ def parse_args():
     parser.add_argument('--data_root', type=str, default='data/processed',
                         help='Path to the processed data directory')
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--epochs', type=int, default=2000)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
+    parser.add_argument('--epochs', type=int, default=2000)
+    parser.add_argument('--warmup_epochs', type=int, default=1500,
+                        help='epochs for reconstruction-only warm-up (classification weight=0)')
+
+    parser.add_argument('--alpha', type=float, default=0.5)
+
     parser.add_argument('--image_size', type=int, default=224)
     parser.add_argument('--num_classes', type=int, default=5)
     parser.add_argument('--window_sec', type=float, default=5.0)
     parser.add_argument('--stride_sec', type=float, default=3.0)
     parser.add_argument('--max_order', type=float, default=20.0)
-    parser.add_argument('--alpha', type=float, default=0.5)
     parser.add_argument('--stft_mode', type=str, default='stft+cross',
                         choices=['stft', 'stft+cross', 'stft_complex'])
     parser.add_argument('--stft_nperseg', type=int, default=1024,
@@ -777,8 +819,6 @@ def parse_args():
                         help='Use ImageNet pretrained weights for ViT')
     parser.add_argument('--port', type=int, default=12355,
                         help='Port for distributed training')
-    parser.add_argument('--warmup_epochs', type=int, default=1500,
-                        help='epochs for reconstruction-only warm-up (classification weight=0)')
     
     parser.add_argument('--log_channel', type=int, default=0,
                     help='로깅할 채널 인덱스 (예: stft+cross 기준 0:|X|^p, 1:|Y|^p, 2:|X·Y*|, 3:cosΔφ). '

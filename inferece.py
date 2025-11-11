@@ -21,7 +21,24 @@ from torch.utils.data import DataLoader
 # === 프로젝트 의존 모듈 (학습 코드와 동일 경로 가정) ===
 from data.dataset import VibrationDataset, OrderInvariantSignalImager
 from tokenizer_trainer.models.ViT_pytorch import VisionTransformerAE
+import random
+import numpy as np
 
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+
+# CuDNN 설정 — 재현성 보장
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+try:
+    torch.set_float32_matmul_precision("high")
+except:
+    pass
 
 # ----------------------------- 유틸 -----------------------------
 
@@ -67,6 +84,8 @@ def print_sample_info(sample, idx: int):
     x = sample.get("x_stft", None)
     ref = sample.get("ref_stft", None)
     y = sample.get("x_cls", None)
+    if idx ==2:
+        print(x[:,:10,:10])
     print(f"[Sample {idx}]")
     print(f"  x_stft    : {_shape(x)} dtype={getattr(x, 'dtype', None)}")
     print(f"  ref_stft  : {_shape(ref)} dtype={getattr(ref, 'dtype', None)}")
@@ -134,7 +153,6 @@ def run_inference(args):
     sample_count = min(3, len(dataset))
     for i in range(sample_count):
         print_sample_info(dataset[i], i)
-
     # -------- 모델 구성 & 체크포인트 로드 --------
     pretty_header("Model & Checkpoint")
     model = VisionTransformerAE(
@@ -151,6 +169,7 @@ def run_inference(args):
         masking_ratio=0.75,
         num_classes=args.num_classes,
     ).to(device)
+
     model.eval()
 
     meta = load_checkpoint(model, args.checkpoint, map_location=device)
@@ -159,51 +178,54 @@ def run_inference(args):
 
     # -------- 추론 --------
     pretty_header("Inference")
-    softmax = nn.Softmax(dim=1)
+    use_bf16 = torch.cuda.is_bf16_supported()
+    scaler = torch.cuda.amp.GradScaler(enabled=not use_bf16)
+    autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
 
     total = 0
     labeled = 0
     correct = 0
+    val_preds_local = []
+    val_labels_local = []
+    val_loss_sum_local = 0.0
+    val_correct_local  = 0.0
+    val_total_local    = 0.0
 
     start_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[START] {start_tag} | batches={len(loader)} | batch_size={args.batch_size}")
 
-    for bidx, batch in enumerate(loader):
-        x = batch['x_stft'].to(device, non_blocking=True)
-        ref_x = batch.get('ref_stft', None)
-        if isinstance(ref_x, torch.Tensor):
-            ref_x = ref_x.to(device, non_blocking=True)
-        y = batch.get('x_cls', None)
-        if isinstance(y, torch.Tensor):
-            y = y.to(device, non_blocking=True)
+    with torch.no_grad():
+        for i, batch  in enumerate(loader):
+            x = batch['x_stft'].to(device, non_blocking=True)
+            y = batch['x_cls'].to(device, non_blocking=True)
+            ref_x = batch['ref_stft'].to(device, non_blocking=True)
 
-        with torch.autocast(device_type='cuda', dtype=amp_dtype):
-            logits, _ = model.forward_classify(current_img=x, normal_img=ref_x)
-            probs = softmax(logits)
-            pred = torch.argmax(probs, dim=1)
+            with torch.autocast(device_type='cuda', dtype=autocast_dtype):
+                rec, _, masked_idx = model.forward_mae(img=x)
+                # b_loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
+                b_loss_mae = nn.MSELoss()(rec, x)
 
-        bs = x.size(0)
-        total += bs
+                logits, diff = model.forward_classify(current_img=x, normal_img=ref_x)
 
-        if isinstance(y, torch.Tensor):
-            labeled += bs
-            correct += (pred == y).sum().item()
+            bs = y.size(0)
+            pred = logits.argmax(dim=1)
+            val_correct_local += (pred == y).sum().item()
+            val_total_local += bs
 
-        if (bidx + 1) % max(1, len(loader) // 10) == 0 or (bidx + 1) == len(loader):
-            print(f"  - processed {bidx+1:>4}/{len(loader)} batches")
+            val_preds_local.append(pred.detach())
+            val_labels_local.append(y.detach())
+
+    t_val = torch.tensor([val_correct_local, val_total_local], dtype=torch.float64, device=device)
+    val_acc  = (t_val[0] / t_val[1] * 100.0).item() if t_val[1] > 0 else 0.0
 
     # -------- 결과 요약 --------
     pretty_header("Results")
-    if labeled > 0:
-        acc = correct / labeled
-        err = 1.0 - acc
-        print(f"Total samples   : {total}")
-        print(f"Labeled samples : {labeled}")
-        print(f"Accuracy        : {acc:.6f}")
-        print(f"Error Rate      : {err:.6f}")
-    else:
-        print("라벨이 없어 Accuracy를 계산할 수 없습니다. (labeled=0)")
-
+    acc = val_acc
+    err = 100.0 - acc
+    print(f"Total samples   : {val_total_local}")
+    print(f"Accuracy        : {acc:.6f}")
+    print(f"Error Rate      : {err:.6f}")
+    
     end_tag = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\n[END] {end_tag}")
 
@@ -231,7 +253,7 @@ def parse_args():
     p.add_argument('--checkpoint', type=str, required=True, help='학습된 모델 체크포인트(.pth)')
 
     # 실행
-    p.add_argument('--batch_size', type=int, default=64)
+    p.add_argument('--batch_size', type=int, default=256)
 
     return p.parse_args()
 

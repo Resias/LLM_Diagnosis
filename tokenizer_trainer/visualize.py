@@ -3,17 +3,12 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from sklearn.decomposition import PCA
 from data.dataset import _channel_labels_for_mode
-import umap
 
 
 # 1) 임베딩/라벨/예측/데이터셋 수집 (배치 돌며 쌓아서 concat)
 # embeds: (N, D), y_true: (N,), y_pred: (N,), ds_name: (N,)  ex) ["A","B","C","D","Val"]
 # 예: y_pred = logits.argmax(1).cpu().numpy()
 
-def umap_2d(embeds, n_neighbors=15, min_dist=0.1, metric="cosine", seed=0):
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors,
-                        min_dist=min_dist, metric=metric, random_state=seed)
-    return reducer.fit_transform(embeds)
 
 def pca_2d(embeds):
     return PCA(n_components=2).fit_transform(embeds)
