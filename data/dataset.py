@@ -204,22 +204,22 @@ class VibrationDataset(Dataset):
         class_idx = self.class_list.index(row['merged_class'])
         x_cls = torch.tensor(class_idx ,dtype=torch.long)
 
-        # x_info = {
-        #     "sampling_rate": float(sr),
-        #     "rpm": float(row["rpm"]),
-        #     "label_class": str(row["class_name"]),
-        #     "merged_class": str(row["merged_class"]),
-        #     "severity": str(row["severity"]),
-        #     "load_condition": str(row["load_condition"]),
-        #     "dataset": str(row["dataset"]),
-        #     "file_name": str(row["file_name"]),
-        # }
+        x_info = {
+            "sampling_rate": float(sr),
+            "rpm": float(row["rpm"]),
+            "label_class": str(row["class_name"]),
+            "merged_class": str(row["merged_class"]),
+            "severity": str(row["severity"]),
+            "load_condition": str(row["load_condition"]),
+            "dataset": str(row["dataset"]),
+            "file_name": str(row["file_name"]),
+        }
         
         data_dict = {
-                # 'x_vib' : x_vib, 
+                'x_vib' : x_vib, 
                 'x_stft' : x_stft,
                 'x_cls' : x_cls,
-                # 'x_info' : x_info
+                'x_info' : x_info
             }
 
         # ---- normal reference (same dataset & load_condition) ----
@@ -235,21 +235,21 @@ class VibrationDataset(Dataset):
                 ref_vib = self._extract_segment(ref_row_idx, ref_start)
                 ref_stft = self.transform(ref_vib, sr=ref_sr, rpm=float(ref_row["rpm"]))
                 tensor_cls_norm = torch.tensor(self.class_list.index('normal'), dtype=torch.long)
-                # ref_info = {
-                #     "sampling_rate": float(ref_sr),
-                #     "rpm": float(ref_row["rpm"]),
-                #     "label_class": str(ref_row["class_name"]),
-                #     "merged_class": str(ref_row["merged_class"]),
-                #     "severity": str(ref_row["severity"]),
-                #     "load_condition": str(ref_row["load_condition"]),
-                #     "dataset": str(ref_row["dataset"]),
-                #     "file_name": str(ref_row["file_name"]),
-                # }
+                ref_info = {
+                    "sampling_rate": float(ref_sr),
+                    "rpm": float(ref_row["rpm"]),
+                    "label_class": str(ref_row["class_name"]),
+                    "merged_class": str(ref_row["merged_class"]),
+                    "severity": str(ref_row["severity"]),
+                    "load_condition": str(ref_row["load_condition"]),
+                    "dataset": str(ref_row["dataset"]),
+                    "file_name": str(ref_row["file_name"]),
+                }
                 ref_dict = {
-                            # 'ref_vib' : ref_vib,
+                            'ref_vib' : ref_vib,
                             'ref_stft' : ref_stft, 
                             'ref_cls' : tensor_cls_norm, 
-                            # 'ref_info' : ref_info
+                            'ref_info' : ref_info
                             }
                 
             data_dict.update(ref_dict)

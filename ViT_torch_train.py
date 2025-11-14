@@ -192,6 +192,37 @@ def vib_collate(batch):
             out[k] = vals
     return out
 
+
+def load_checkpoint_if_any(model, optimizer, path, device, strict=False, resume_optim=True):
+    """
+    반환: (start_epoch, best_val_acc)
+    - ckpt의 'epoch'가 t라면 다음 에폭 t+1부터 시작
+    - state_dict 키: {'model_state_dict', 'optimizer_state_dict', 'epoch', 'val_acc'}
+    """
+    if not path or not os.path.isfile(path):
+        return 0, 0.0
+
+    ckpt = torch.load(path, map_location=device)
+
+    # 모델 로드 (DDP 안전하게)
+    net = model.module if isinstance(model, DDP) else model
+    state_dict = ckpt.get('model_state_dict', ckpt)  # 호환용
+    missing, unexpected = net.load_state_dict(state_dict, strict=strict)
+    if not strict and (missing or unexpected):
+        print(f"[resume] non-strict load: missing={len(missing)}, unexpected={len(unexpected)}")
+
+    # 옵티마이저 로드
+    if resume_optim and ('optimizer_state_dict' in ckpt):
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        except Exception as e:
+            print(f"[resume] optimizer state load skipped ({e})")
+
+    start_epoch = int(ckpt.get('epoch', -1)) + 1
+    best_val_acc = float(ckpt.get('val_acc', 0.0))
+    print(f"[resume] loaded '{path}' (resume from epoch {start_epoch}, best_val_acc={best_val_acc:.4f})")
+    return start_epoch, best_val_acc
+
 def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
                 num_epochs, device, rank, config, start_epoch=0, init_best_val_acc=0.0, dataset_select=None):
     net = unwrap_ddp(model)
@@ -727,6 +758,23 @@ def train_with_config(rank, world_size, args):
     # optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
     optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
     
+    # --- 체크포인트 로드 ---
+    start_epoch = 0
+    init_best_val_acc = 0.0
+    if getattr(config, "resume_path", ""):
+        start_epoch, init_best_val_acc = load_checkpoint_if_any(
+            model=model,
+            optimizer=optimizer,
+            path=config.resume_path,
+            device=device,
+            strict=bool(getattr(config, "resume_strict", False)),
+            resume_optim=not bool(getattr(config, "no_resume_optim", False)),
+        )
+    # 명시적 override가 있으면 적용
+    if int(getattr(config, "resume_epoch_override", -1)) >= 0:
+        start_epoch = int(config.resume_epoch_override)
+        print(f"[resume] epoch override -> start_epoch={start_epoch}")
+    
     # 학습 실행
     train_model(
         alpha=config.alpha,
@@ -739,7 +787,9 @@ def train_with_config(rank, world_size, args):
         device=device,
         rank=rank,
         config=config,
-        dataset_select=args.dataset_select
+        dataset_select=args.dataset_select,
+        start_epoch=start_epoch,
+        init_best_val_acc=init_best_val_acc
     )
     
     cleanup()  # process group destroy
@@ -845,6 +895,14 @@ def parse_args():
     parser.add_argument('--cached', action="store_true", help="Data loading True/False")
     parser.add_argument('--dataset_select', type=int, default=0, help="0: all, 1: except vat, 2: except vbl, 3: except mfd, 4: except dxai")
 
+    parser.add_argument('--resume_path', type=str, default='',
+                        help='재개할 체크포인트 경로(.pth). 비우면 새로 시작')
+    parser.add_argument('--resume_strict', action='store_true',
+                        help='모델 state_dict strict 로드 (레이어 변경 시 비권장)')
+    parser.add_argument('--no_resume_optim', action='store_true',
+                        help='설정 시 optimizer 상태는 복구하지 않음')
+    parser.add_argument('--resume_epoch_override', type=int, default=-1,
+                        help='>=0이면 ckpt의 epoch 대신 이 값을 시작 에폭으로 사용')
 
 
     return parser.parse_args()

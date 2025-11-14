@@ -1,3 +1,4 @@
+import torch
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
@@ -86,8 +87,8 @@ def create_reconstruction_figure(
     원본과 재구성 이미지를 채널별로 나란히 비교하는 matplotlib Figure를 생성합니다.
     이 Figure 객체는 wandb.Image()로 변환되어 로깅될 수 있습니다.
     """
-    orig_arr = orig_tensor.detach().cpu().numpy()
-    rec_arr = rec_tensor.detach().cpu().numpy()
+    orig_arr = orig_tensor.detach().to(dtype=torch.float32).cpu().numpy()
+    rec_arr  = rec_tensor.detach().to(dtype=torch.float32).cpu().numpy()
     
     assert orig_arr.ndim == 3, "Input must be (C,H,W)"
     C, H, W = orig_arr.shape
