@@ -282,7 +282,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
             optimizer.zero_grad()
 
             with torch.autocast(device_type='cuda', dtype=autocast_dtype):
-                rec, _, masked_idx = net.forward_mae(img=x)
+                # rec, _, masked_idx = net.forward_mae(img=x)
+                rec = net.reconstruct(img=x)
                 # loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
                 loss_mae = nn.MSELoss()(rec, x)
 
@@ -376,7 +377,8 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
                 ref_x = batch['ref_stft'].to(device, non_blocking=True)
 
                 with torch.autocast(device_type='cuda', dtype=autocast_dtype):
-                    rec, _, masked_idx = net.forward_mae(img=x)
+                    # rec, _, masked_idx = net.forward_mae(img=x)
+                    rec = net.reconstruct(img=x)
                     # b_loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
                     b_loss_mae = nn.MSELoss()(rec, x)
 
@@ -470,6 +472,22 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
             if wandb.run is not None:
                 wandb.log(log_dict)
 
+
+            if warmup_epochs - 1 == epoch:                
+                if dataset_select is None:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': state_dict,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_acc': val_acc,
+                    }, os.path.join('checkpoints', 'only_recon_model.pth'))
+                else:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': state_dict,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_acc': val_acc,
+                    }, os.path.join(f'checkpoints', f'only_recon_model_{dataset_select}_{config.run_name}.pth'))
             # 베스트 저장
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
@@ -487,7 +505,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
                         'model_state_dict': state_dict,
                         'optimizer_state_dict': optimizer.state_dict(),
                         'val_acc': val_acc,
-                    }, os.path.join(f'checkpoints', f'best_model_{dataset_select}.pth'))
+                    }, os.path.join(f'checkpoints', f'best_model_{dataset_select}_{config.run_name}.pth'))
             print(f"[{epoch+1}/{num_epochs}] "
                   f"train_loss={train_loss:.4f} train_acc={train_acc:.2f}% | "
                   f"val_loss={val_loss:.4f} val_acc={val_acc:.2f}%")
@@ -505,7 +523,7 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
                 'model_state_dict': state_dict,
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
-            }, os.path.join(f'checkpoints', f'last_model_{dataset_select}.pth'))
+            }, os.path.join(f'checkpoints', f'last_model_{dataset_select}_{config.run_name}.pth'))
 
         
         # ---------------- Light Logging (embeddings table) ----------------
@@ -755,8 +773,8 @@ def train_with_config(rank, world_size, args):
     
     # 손실 함수와 옵티마이저 설정
     criterion = nn.CrossEntropyLoss()
-    # optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
-    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
+    # optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
     
     # --- 체크포인트 로드 ---
     start_epoch = 0
@@ -841,13 +859,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train ViT for Vibration Diagnosis')
     parser.add_argument('--data_root', type=str, default='data/processed',
                         help='Path to the processed data directory')
-    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=2000)
-    parser.add_argument('--warmup_epochs', type=int, default=1500,
+    parser.add_argument('--epochs', type=int, default=6000)
+    parser.add_argument('--warmup_epochs', type=int, default=5500,
                         help='epochs for reconstruction-only warm-up (classification weight=0)')
 
-    parser.add_argument('--alpha', type=float, default=0.5)
+    parser.add_argument('--alpha', type=float, default=0.7)
 
     parser.add_argument('--image_size', type=int, default=224)
     parser.add_argument('--num_classes', type=int, default=5)
@@ -863,7 +881,7 @@ def parse_args():
     parser.add_argument('--stft_power', type=float, default=1.0,
                         help='Power of magnitude (1.0 for magnitude, 2.0 for power spectrum)')
     
-    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-final_1105night_2050')
+    parser.add_argument('--project_name', type=str, default='vibration-diagnosis-final_1117-save_results')
     parser.add_argument('--run_name', type=str, default='All_dataset_non_masking')
     parser.add_argument('--pretrained', type=bool, default=False,
                         help='Use ImageNet pretrained weights for ViT')
@@ -875,7 +893,7 @@ def parse_args():
                          '-1이면 에폭마다 채널을 순환.')
     parser.add_argument('--log_images', action='store_true',
                     help='이미지 로깅 활성화 (rank0 전용)')
-    parser.add_argument('--img_log_every', type=int, default=100,
+    parser.add_argument('--img_log_every', type=int, default=500,
                         help='이미지 로깅 에폭 주기')
     parser.add_argument('--img_log_k', type=int, default=4,
                         help='배치에서 로깅할 최대 샘플 수')
@@ -884,7 +902,7 @@ def parse_args():
 
     parser.add_argument('--log_embeddings', action='store_true',
                         help='임베딩 테이블 로깅 활성화 (rank0 전용)')
-    parser.add_argument('--emb_log_every', type=int, default=100,
+    parser.add_argument('--emb_log_every', type=int, default=500,
                         help='임베딩 테이블 로깅 에폭 주기')
     parser.add_argument('--emb_per_rank', type=int, default=32,
                         help='각 rank에서 샘플링할 임베딩 개수 (작게 유지)')
@@ -915,3 +933,5 @@ if __name__ == "__main__":
         raise RuntimeError("CUDA is not available. This code requires GPU support.")
     
     run_training(args)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
