@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader
 
 from data.dataset import OrderInvariantSignalImager, VibrationDataset
 
-flag = 1  # 0: non diff latent, 1: diff latent
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # -----------------------------
 # Dataset
@@ -34,17 +34,36 @@ dataset = VibrationDataset(
     transform=signal_imger,
 )
 
-loader = DataLoader(dataset, batch_size=64, shuffle=True)
+loader = DataLoader(dataset, batch_size=1024, shuffle=True)
 
 # -----------------------------
 # Model & Latents
 # -----------------------------
-model = load_model("/root/tmp/LLM_Diagnosis/checkpoints/last_model_1_ds1_20260106_112809.pth")
 
-latents, labels = extract_latents(model, loader, max_batches=1000, select=flag)
+path =[
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/last_model_4_ds4_20251209_030620.pth',
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/only_recon_model_Except_DXAI.pth',
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/last_model_3_ds3_20251203_035437.pth',
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/only_recon_model_3_ds3_20251203_035437.pth',
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/last_model_2_ds2_20251201_020043.pth',
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/only_recon_model_2_ds2_20251201_020043.pth',
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/last_model_1_ds1_20251128_023043.pth',
+    '/root/tmp/LLM_Diagnosis/checkpoints_saving_before_260106/only_recon_model_1_ds1_20251128_023043.pth'
+]
 
-# -----------------------------
-# Visualization
-# -----------------------------
-plot_pca(latents, labels, save_path=f"pca_latent_{flag}.png")
-plot_tsne(latents, labels, save_path=f"tsne_latent_{flag}.png")
+select = [0,1]
+
+for p in path:
+    for flag in select:
+        model = load_model(p).to(device)
+
+        latents, labels = extract_latents(model, loader, max_batches=1000, select=flag, device=device)
+
+        # -----------------------------
+        # Visualization
+        # -----------------------------
+        model_setting = p.split('/')[-1].split('ds')[0]
+        print(f"Processing {model_setting} with flag {flag}...")
+        flag_select = f"non_diff" if flag == 0 else f"diff"
+        plot_pca(latents, labels, save_path=f"{model_setting}_pca_latent_{flag_select}.png")
+        plot_tsne(latents, labels, save_path=f"{model_setting}_tsne_latent_{flag_select}.png")

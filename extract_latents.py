@@ -39,14 +39,13 @@ def load_model(ckpt_path: str):
 # 2. Latent 벡터 추출
 # -----------------------------
 @torch.no_grad()
-def extract_latents(model, dataloader, max_batches=None, select=0):
+def extract_latents(model, dataloader, max_batches=None, select=0, device=None):
     latents = []
     labels = []
-
     for i, batch in enumerate(tqdm(dataloader, desc="Extracting latents")):
-        x = batch["x_stft"].to(DEVICE)
-        y = batch["x_cls"].to(DEVICE)
-        ref_x = batch['ref_stft'].to(DEVICE)
+        x = batch["x_stft"].to(device)
+        y = batch["x_cls"].to(device)
+        ref_x = batch['ref_stft'].to(device)
 
         if select == 0:
             z = model.encode(x)   # (B, 768)

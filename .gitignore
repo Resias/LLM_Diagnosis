@@ -9,9 +9,9 @@ cached_dataset.pt
 .DS_Store
 results/
 *.ipynb
-checkpoints/*.pth
+checkpoints/
+checkpoints_saving_before_260106/
 wandb/
-checkpoints/*.pth
 cmd
 docs_eng/
 model_cache/
