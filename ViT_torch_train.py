@@ -283,14 +283,14 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
 
             with torch.autocast(device_type='cuda', dtype=autocast_dtype):
                 # rec, _, masked_idx = net.forward_mae(img=x)
-                rec = net.reconstruct(img=x)
+                # rec = net.reconstruct(img=x)
                 # loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
-                loss_mae = nn.MSELoss()(rec, x)
+                # loss_mae = nn.MSELoss()(rec, x)
 
                 logits, diff = net.forward_classify(current_img=x, normal_img=ref_x)
                 loss_cls = criterion(logits, y)
 
-                loss = effective_alpha * loss_cls + (1.0 - effective_alpha) * loss_mae
+                loss = effective_alpha * loss_cls + (1.0 - effective_alpha) # * loss_mae
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -306,18 +306,18 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
             train_labels_local.append(y.detach())
             
             # 이미지 로깅: 첫 배치에서만, 큰 간격으로
-            if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
-                # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0] )
-                fig = create_reconstruction_figure(
-                    orig_tensor=x[0],
-                    rec_tensor=rec[0],
-                    mode=config.stft_mode,  # config에서 파라미터 가져오기
-                    max_order=config.max_order,
-                    window_sec=config.window_sec
-                )
-                # Figure를 wandb.Image 객체로 변환
-                reconstruction_image_to_log = wandb.Image(fig)
-                plt.close(fig)
+            # if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
+            #     # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0] )
+            #     fig = create_reconstruction_figure(
+            #         orig_tensor=x[0],
+            #         rec_tensor=rec[0],
+            #         mode=config.stft_mode,  # config에서 파라미터 가져오기
+            #         max_order=config.max_order,
+            #         window_sec=config.window_sec
+            #     )
+            #     # Figure를 wandb.Image 객체로 변환
+            #     reconstruction_image_to_log = wandb.Image(fig)
+            #     plt.close(fig)
             
 
             # 임베딩 테이블은 에폭 말에 한 번만 기록할 것이므로 마지막 배치 참조만 유지
@@ -339,20 +339,21 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
         train_loss = (t_train[0] / t_train[2]).item() if t_train[2] > 0 else 0.0
         train_acc = (t_train[1] / t_train[2] * 100.0).item() if t_train[2] > 0 else 0.0
 
-        # sklearn metrics (rank별 로컬; 보고용)
-        train_preds_local = torch.cat(train_preds_local, dim=0).detach().cpu().numpy()
-        train_labels_local = torch.cat(train_labels_local, dim=0).detach().cpu().numpy()
-        train_metrics = {
-            "precision_weighted": precision_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
-            "recall_weighted":    recall_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
-            "f1_weighted":        f1_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
-            "precision_micro":  precision_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
-            "recall_micro":     recall_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
-            "f1_micro":         f1_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
-            "precision_macro":  precision_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
-            "recall_macro":     recall_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
-            "f1_macro":         f1_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
-        }
+        if is_main and epoch % 10 == 0:
+            # sklearn metrics (rank별 로컬; 보고용)
+            train_preds_local = torch.cat(train_preds_local, dim=0).detach().cpu().numpy()
+            train_labels_local = torch.cat(train_labels_local, dim=0).detach().cpu().numpy()
+            train_metrics = {
+                "precision_weighted": precision_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
+                "recall_weighted":    recall_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
+                "f1_weighted":        f1_score(train_labels_local, train_preds_local, average="weighted", zero_division=0),
+                "precision_micro":  precision_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
+                "recall_micro":     recall_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
+                "f1_micro":         f1_score(train_labels_local, train_preds_local, average="micro", zero_division=0),
+                "precision_macro":  precision_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
+                "recall_macro":     recall_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
+                "f1_macro":         f1_score(train_labels_local, train_preds_local, average="macro", zero_division=0),
+            }
         
         # ---------------- Val ----------------
         # Validation phase
@@ -378,14 +379,14 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
 
                 with torch.autocast(device_type='cuda', dtype=autocast_dtype):
                     # rec, _, masked_idx = net.forward_mae(img=x)
-                    rec = net.reconstruct(img=x)
+                    # rec = net.reconstruct(img=x)
                     # b_loss_mae = net.calculate_mae_loss(rec, x, masked_idx)
-                    b_loss_mae = nn.MSELoss()(rec, x)
+                    # b_loss_mae = nn.MSELoss()(rec, x)
 
                     logits, diff = net.forward_classify(current_img=x, normal_img=ref_x)
                     b_loss_cls = criterion(logits, y)
 
-                    b_loss = effective_alpha * b_loss_cls + (1.0 - effective_alpha) * b_loss_mae
+                    b_loss = effective_alpha * b_loss_cls + (1.0 - effective_alpha) # * b_loss_mae
 
                 bs = y.size(0)
                 val_loss_sum_local += b_loss.item() * bs
@@ -396,19 +397,19 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
                 val_preds_local.append(pred.detach())
                 val_labels_local.append(y.detach())
 
-                # 이미지 로깅: 첫 배치에서만, 큰 간격으로
-                if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
-                    # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0] )
-                    fig = create_reconstruction_figure(
-                        orig_tensor=x[0],
-                        rec_tensor=rec[0],
-                        mode=config.stft_mode,  # config에서 파라미터 가져오기
-                        max_order=config.max_order,
-                        window_sec=config.window_sec
-                    )
-                    # Figure를 wandb.Image 객체로 변환
-                    val_reconstruction_image_to_log = wandb.Image(fig)
-                    plt.close(fig)
+                # # 이미지 로깅: 첫 배치에서만, 큰 간격으로
+                # if LOG_IMAGES and is_main and (epoch % IMG_LOG_EVERY == 0):
+                #     # 첫 번째 샘플에 대해 시각화 (inputs[0], rec_img[0] )
+                #     fig = create_reconstruction_figure(
+                #         orig_tensor=x[0],
+                #         rec_tensor=rec[0],
+                #         mode=config.stft_mode,  # config에서 파라미터 가져오기
+                #         max_order=config.max_order,
+                #         window_sec=config.window_sec
+                #     )
+                #     # Figure를 wandb.Image 객체로 변환
+                #     val_reconstruction_image_to_log = wandb.Image(fig)
+                #     plt.close(fig)
 
                 # 임베딩 로깅용 참조 저장(마지막 배치)
                 last_val_diff = diff.detach()
@@ -420,26 +421,27 @@ def train_model(alpha, model, train_loader, val_loader, criterion, optimizer,
         val_loss = (t_val[0] / t_val[2]).item() if t_val[2] > 0 else 0.0
         val_acc  = (t_val[1] / t_val[2] * 100.0).item() if t_val[2] > 0 else 0.0
 
-        val_preds_local = torch.cat(val_preds_local, dim=0).detach().cpu().numpy()
-        val_labels_local = torch.cat(val_labels_local, dim=0).detach().cpu().numpy()
-        val_metrics = {
-            "precision_weighted": precision_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
-            "recall_weighted":    recall_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
-            "f1_weighted":        f1_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
-            "precision_micro":  precision_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
-            "recall_micro":     recall_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
-            "f1_micro":         f1_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
-            "precision_macro":  precision_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
-            "recall_macro":     recall_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
-            "f1_macro":         f1_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
-        }
+        if is_main and epoch % 10 == 0:
+            val_preds_local = torch.cat(val_preds_local, dim=0).detach().cpu().numpy()
+            val_labels_local = torch.cat(val_labels_local, dim=0).detach().cpu().numpy()
+            val_metrics = {
+                "precision_weighted": precision_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
+                "recall_weighted":    recall_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
+                "f1_weighted":        f1_score(val_labels_local, val_preds_local, average="weighted", zero_division=0),
+                "precision_micro":  precision_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
+                "recall_micro":     recall_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
+                "f1_micro":         f1_score(val_labels_local, val_preds_local, average="micro", zero_division=0),
+                "precision_macro":  precision_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
+                "recall_macro":     recall_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
+                "f1_macro":         f1_score(val_labels_local, val_preds_local, average="macro", zero_division=0),
+            }
 
         if dist.is_available() and dist.is_initialized():
             dist.barrier()
         
         # Log metrics to wandb
         # ---------------- Light Logging (scalars) ----------------
-        if is_main:
+        if is_main and epoch % 10 == 0:
             log_dict = {
                 "epoch": epoch,
                 "train/loss": train_loss,
@@ -737,14 +739,14 @@ def train_with_config(rank, world_size, args):
     # 데이터로더 생성
     train_loader = DataLoader(train_dataset, 
                             batch_size=config.batch_size, 
-                            num_workers=2,
+                            num_workers=1,
                             sampler=train_sampler,
                             shuffle=False,
                             pin_memory=True,
                             collate_fn=vib_collate)
     val_loader = DataLoader(val_dataset, 
                           batch_size=config.batch_size, 
-                          num_workers=2,
+                          num_workers=1,
                           sampler=val_sampler,
                           shuffle=False,
                           pin_memory=True,
@@ -760,7 +762,7 @@ def train_with_config(rank, world_size, args):
         attention_dropout  = 0.0,
         norm_layer = partial(nn.LayerNorm, eps=1e-6),
         image_size = 224,
-        image_channel = 4,
+        image_channel = 2,
         patch_size = 16,
         masking_ratio=0.75,
         num_classes=config.num_classes,
@@ -826,13 +828,13 @@ def run_training(args):
     os.makedirs('checkpoints', exist_ok=True)
     
     try:
-        # mp.spawn(
-        #     train_with_config,
-        #     args=(world_size, args),
-        #     nprocs=world_size,
-        #     join=True
-        # )
-        train_with_config(rank=0, world_size=world_size, args=args)
+        mp.spawn(
+            train_with_config,
+            args=(world_size, args),
+            nprocs=world_size,
+            join=True
+        )
+        # train_with_config(rank=0, world_size=world_size, args=args)
     except Exception as e:
         print(f"Error during training: {e}")
         raise
@@ -859,10 +861,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Train ViT for Vibration Diagnosis')
     parser.add_argument('--data_root', type=str, default='data/processed',
                         help='Path to the processed data directory')
-    parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--learning_rate', type=float, default=1e-4)
-    parser.add_argument('--epochs', type=int, default=6000)
-    parser.add_argument('--warmup_epochs', type=int, default=5500,
+    parser.add_argument('--epochs', type=int, default=1000)
+    parser.add_argument('--warmup_epochs', type=int, default=0,
                         help='epochs for reconstruction-only warm-up (classification weight=0)')
 
     parser.add_argument('--alpha', type=float, default=0.7)
@@ -872,7 +874,7 @@ def parse_args():
     parser.add_argument('--window_sec', type=float, default=5.0)
     parser.add_argument('--stride_sec', type=float, default=3.0)
     parser.add_argument('--max_order', type=float, default=20.0)
-    parser.add_argument('--stft_mode', type=str, default='stft+cross',
+    parser.add_argument('--stft_mode', type=str, default='stft',
                         choices=['stft', 'stft+cross', 'stft_complex'])
     parser.add_argument('--stft_nperseg', type=int, default=1024,
                         help='Length of each STFT segment')
@@ -933,5 +935,6 @@ if __name__ == "__main__":
         raise RuntimeError("CUDA is not available. This code requires GPU support.")
     
     run_training(args)
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if dist.get_rank() == 0:
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()

@@ -362,7 +362,7 @@ class OrderInvariantSignalImager:
 
         if self.normalize == "per_channel":
             for c in range(x.shape[0]):
-                if c == x.shape[0] - 1:  # 마지막 채널(phase)은 정규화 건너뜀
+                if self.mode in ("stft+cross", "stft_complex") and c == x.shape[0] - 1:
                     continue
                 m = x[c].mean()
                 s = x[c].std() + self.eps
@@ -471,31 +471,46 @@ class OrderInvariantSignalImager:
         # 1) 계수/채널 맵 + 주파수축 얻기
         if self.mode.startswith("stft"):
             f, t, arr = self._build_stft_maps(seg, sr)  # arr: (C, F, T)
-            order = f / f_rot                            # (F,)
+            C, F, T = arr.shape
+            # order = f / f_rot                            # (F,)
         else:
             print('err')
             exit()
-        # 2) order 마스킹 (0 < order ≤ max_order)
-        mask = (order > 0) & (order <= self.max_order)
-        if not np.any(mask):
-            # 모든 bin이 마스크되면 최소한 한 줄은 유지
-            idx = np.argmax(order > 0)
-            mask = np.zeros_like(order, dtype=bool)
-            mask[idx] = True
-        arr = arr[:, mask, :]           # (C, Hm, T)
-        order = order[mask]             # (Hm,)
-        # 3) order축을 0..max_order 균일 그리드로 리샘플
-        #    현재 arr는 order가 불균일일 수 있으므로, 채널/시간별로 1D 보간
-        Hm, T = arr.shape[1], arr.shape[2]
-        order_target = np.linspace(0.0, self.max_order, self.H_out, endpoint=True)
-        out_ord = np.empty((arr.shape[0], self.H_out, T), dtype=arr.dtype)
-        # order가 단조 증가임을 가정 (STFT/CWT에서 주파수 증가는 보장)
-        for c in range(arr.shape[0]):
+        
+        # # 2) order 마스킹 (0 < order ≤ max_order)
+        # mask = (order > 0) & (order <= self.max_order)
+        # if not np.any(mask):
+        #     # 모든 bin이 마스크되면 최소한 한 줄은 유지
+        #     idx = np.argmax(order > 0)
+        #     mask = np.zeros_like(order, dtype=bool)
+        #     mask[idx] = True
+        # arr = arr[:, mask, :]           # (C, Hm, T)
+        # order = order[mask]             # (Hm,)
+        # # 3) order축을 0..max_order 균일 그리드로 리샘플
+        # #    현재 arr는 order가 불균일일 수 있으므로, 채널/시간별로 1D 보간
+        # Hm, T = arr.shape[1], arr.shape[2]
+        # order_target = np.linspace(0.0, self.max_order, self.H_out, endpoint=True)
+        # out_ord = np.empty((arr.shape[0], self.H_out, T), dtype=arr.dtype)
+        # # order가 단조 증가임을 가정 (STFT/CWT에서 주파수 증가는 보장)
+        # for c in range(arr.shape[0]):
+        #     for t_idx in range(T):
+        #         out_ord[c, :, t_idx] = np.interp(order_target, order, arr[c, :, t_idx],
+        #                                          left=arr[c, 0, t_idx], right=arr[c, -1, t_idx])
+        
+        # 2) freq-axis → H_out 로 리샘플 (order 변환 제거)
+        freq_target = np.linspace(f[0], f[-1], self.H_out)
+        out_freq = np.empty((C, self.H_out, T), dtype=arr.dtype)
+
+        for c in range(C):
             for t_idx in range(T):
-                out_ord[c, :, t_idx] = np.interp(order_target, order, arr[c, :, t_idx],
-                                                 left=arr[c, 0, t_idx], right=arr[c, -1, t_idx])
+                out_freq[c, :, t_idx] = np.interp(
+                    freq_target, f, arr[c, :, t_idx],
+                    left=arr[c, 0, t_idx],
+                    right=arr[c, -1, t_idx]
+                )
         # 4) 시간축도 고정 bins로 리사이즈
-        out = self._resize_CHW(out_ord, self.H_out, self.W_out)  # (C, H_out, W_out)
+        # out = self._resize_CHW(out_ord, self.H_out, self.W_out)  # (C, H_out, W_out)
+        out = self._resize_CHW(out_freq, self.H_out, self.W_out)  # (C, H_out, W_out)
         # 5) log/정규화 → 텐서
         out = self._apply_log_norm(out)
         return torch.as_tensor(out, dtype=self.out_dtype)    
@@ -627,7 +642,7 @@ if __name__ == '__main__':
     #
     # ================= ALL DATASET TEST & SAVE ======================
     signal_imger = OrderInvariantSignalImager(
-                                mode='stft+cross',
+                                mode='stft',
                                 log1p=True,
                                 normalize= "per_channel",  
                                 eps=1e-8,
@@ -736,72 +751,72 @@ if __name__ == '__main__':
 
 
     # Automatic LOO dataset generation
-    # # ================= LOO DATASET TEST & SAVE ======================
-    print("Processing LOO DATASET")
-    print("Processing LOO DATASET")
-    print("Processing LOO DATASET")
-    dataset_list = ['vat', 'vbl', 'mfd', 'dxai']
-    for except_dataset in dataset_list:
-        signal_imger = OrderInvariantSignalImager(
-                                mode='stft+cross',
-                                log1p=True,
-                                normalize= "per_channel",  
-                                eps=1e-8,
-                                out_dtype=torch.float32,
-                                max_order=20.0,           
-                                H_out=224,                
-                                W_out=224,               
-                                stft_nperseg=1024,
-                                stft_hop=256,
-                                stft_window="hann",
-                                stft_center=True,
-                                stft_power=1.0,           
-                            )
-        vib_trainset = VibrationDataset(
-                                    data_root=args.data_root,
-                                    using_dataset = [d for d in dataset_list if d != except_dataset],
-                                    window_sec=5,
-                                    stride_sec=3,            
-                                    transform=signal_imger,
-                                )
-        vib_valset = VibrationDataset(
-                                    data_root=args.data_root,
-                                    using_dataset = [except_dataset],
-                                    window_sec=5,
-                                    stride_sec=3,             
-                                    transform=signal_imger,
-                                )
-        all_train_data = []
-        all_valid_data = []
-        for data_sample in tqdm(vib_trainset, dynamic_ncols=True, desc="Train dataset gathering"):
-            all_train_data.append(data_sample)
-        for data_sample in tqdm(vib_valset, dynamic_ncols=True, desc="Valid dataset gathering"):
-            all_valid_data.append(data_sample)
-        # =========== SAVE ===================
-        torch.save(all_train_data, os.path.join(args.data_root, f'llm_vib_trainset_3dataset_except_{except_dataset}.pt'))
-        torch.save(all_valid_data, os.path.join(args.data_root, f'llm_vib_validset_only_{except_dataset}.pt'))
+    # # # ================= LOO DATASET TEST & SAVE ======================
+    # print("Processing LOO DATASET")
+    # print("Processing LOO DATASET")
+    # print("Processing LOO DATASET")
+    # dataset_list = ['vat', 'vbl', 'mfd', 'dxai']
+    # for except_dataset in dataset_list:
+    #     signal_imger = OrderInvariantSignalImager(
+    #                             mode='stft+cross',
+    #                             log1p=True,
+    #                             normalize= "per_channel",  
+    #                             eps=1e-8,
+    #                             out_dtype=torch.float32,
+    #                             max_order=20.0,           
+    #                             H_out=224,                
+    #                             W_out=224,               
+    #                             stft_nperseg=1024,
+    #                             stft_hop=256,
+    #                             stft_window="hann",
+    #                             stft_center=True,
+    #                             stft_power=1.0,           
+    #                         )
+    #     vib_trainset = VibrationDataset(
+    #                                 data_root=args.data_root,
+    #                                 using_dataset = [d for d in dataset_list if d != except_dataset],
+    #                                 window_sec=5,
+    #                                 stride_sec=3,            
+    #                                 transform=signal_imger,
+    #                             )
+    #     vib_valset = VibrationDataset(
+    #                                 data_root=args.data_root,
+    #                                 using_dataset = [except_dataset],
+    #                                 window_sec=5,
+    #                                 stride_sec=3,             
+    #                                 transform=signal_imger,
+    #                             )
+    #     all_train_data = []
+    #     all_valid_data = []
+    #     for data_sample in tqdm(vib_trainset, dynamic_ncols=True, desc="Train dataset gathering"):
+    #         all_train_data.append(data_sample)
+    #     for data_sample in tqdm(vib_valset, dynamic_ncols=True, desc="Valid dataset gathering"):
+    #         all_valid_data.append(data_sample)
+    #     # =========== SAVE ===================
+    #     torch.save(all_train_data, os.path.join(args.data_root, f'llm_vib_trainset_3dataset_except_{except_dataset}.pt'))
+    #     torch.save(all_valid_data, os.path.join(args.data_root, f'llm_vib_validset_only_{except_dataset}.pt'))
 
-        # =========== LOAD & TEST CACHED DATASET ===================
-        # train_data_root = os.path.join(args.data_root, f'llm_vib_trainset_3dataset_except_{except_dataset}.pt')
-        # valid_data_root = os.path.join(args.data_root, f'llm_vib_validset_only_{except_dataset}.pt')
+    #     # =========== LOAD & TEST CACHED DATASET ===================
+    #     # train_data_root = os.path.join(args.data_root, f'llm_vib_trainset_3dataset_except_{except_dataset}.pt')
+    #     # valid_data_root = os.path.join(args.data_root, f'llm_vib_validset_only_{except_dataset}.pt')
 
-        # vib_trainset_cached = CachedDataset(data_root=train_data_root)
-        # vib_valset_cached = CachedDataset(data_root=valid_data_root)
+    #     # vib_trainset_cached = CachedDataset(data_root=train_data_root)
+    #     # vib_valset_cached = CachedDataset(data_root=valid_data_root)
 
-        # data_dict = vib_trainset[0]
-        # for k in data_dict.keys():
-        #     print(f'\nkey : {k}')
-        #     print(f'item : {data_dict[k]}')
-        #     print(f'type : {type(data_dict[k])}\n')
-        # data_dict =vib_trainset_cached[0]    
-        # for k in data_dict.keys():
-        #     print(f'\nkey : {k}')
-        #     print(f'item : {data_dict[k]}')
-        #     print(f'type : {type(data_dict[k])}\n')
+    #     # data_dict = vib_trainset[0]
+    #     # for k in data_dict.keys():
+    #     #     print(f'\nkey : {k}')
+    #     #     print(f'item : {data_dict[k]}')
+    #     #     print(f'type : {type(data_dict[k])}\n')
+    #     # data_dict =vib_trainset_cached[0]    
+    #     # for k in data_dict.keys():
+    #     #     print(f'\nkey : {k}')
+    #     #     print(f'item : {data_dict[k]}')
+    #     #     print(f'type : {type(data_dict[k])}\n')
         
-        # print(except_dataset, 'is valid dataset')
-        # print("Train len(before save):", len(vib_trainset))
-        # print("Valid len(before save):", len(vib_valset))
-        # print("Train len(after load):", len(vib_trainset_cached))
-        # print("Valid len(after load):", len(vib_valset_cached))
+    #     # print(except_dataset, 'is valid dataset')
+    #     # print("Train len(before save):", len(vib_trainset))
+    #     # print("Valid len(before save):", len(vib_valset))
+    #     # print("Train len(after load):", len(vib_trainset_cached))
+    #     # print("Valid len(after load):", len(vib_valset_cached))
     

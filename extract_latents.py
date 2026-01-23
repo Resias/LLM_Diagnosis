@@ -13,7 +13,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # -----------------------------
 # 1. 모델 로드
 # -----------------------------
-def load_model(ckpt_path: str):
+def load_model(ckpt_path: str, img_ch=4):
     model = VisionTransformerAE(
         num_layers=12,
         num_heads=12,
@@ -23,7 +23,7 @@ def load_model(ckpt_path: str):
         attention_dropout=0.0,
         norm_layer=partial(nn.LayerNorm, eps=1e-6),
         image_size=224,
-        image_channel=4,
+        image_channel=img_ch,
         patch_size=16,
         masking_ratio=0.75,
         num_classes=5
